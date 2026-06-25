@@ -1,0 +1,63 @@
+# Pipe-cleaner end-to-end training configuration — GPU run.
+#
+# Goals: functional MVP, gradients run e2e, single person, multi-camera,
+# multi-timestep.  No denoising.  See development_plan.md for full scope.
+
+data:
+  provider: human_prior_aligned
+  human_prior_repo: ../human_prior
+  human_prior_aligned_dirs:
+    - "G:\\My Drive\\FitnessData\\test_output_h36m"
+    - "G:\\My Drive\\FitnessData\\test_output_moyo"
+    - "G:\\My Drive\\FitnessData\\test_output_mpi3dhp"
+  human_prior_h36m_dataset_path: "G:\\My Drive\\FitnessData\\Human3.6"
+  human_prior_moyo_dataset_path: "G:\\My Drive\\FitnessData\\MoYo"
+  human_prior_mpi_dataset_path: "G:\\My Drive\\FitnessData\\mpi_inf_3dhp"
+  image_height: 640
+  image_width: 640
+  num_cameras: 4
+  seq_len: 4
+  stride: 1
+  val_fraction: 0.2
+  split_seed: 0
+  batch_size: 4        # optimized for RTX 4090 24 GB (4 x T4 x N4 = 64 images/step)
+  num_workers: 0
+  max_people: 1
+  max_samples_per_epoch: 1000  # 250 batches/epoch; ~30-60 s on GPU
+
+model:
+  num_joints: 12
+  backbone_type: yolo_pose
+  yolo_model_name: yolo11n-pose.pt
+  yolo_feature_index: 19
+  yolo_trainable: false   # YOLO frozen for pipe-cleaner
+  depth_num: 24
+  depth_start_mm: 200.0
+  depth_max_mm: 9000.0
+  lid_depth: true
+  num_queries: 16
+  num_propagated: 4
+  memory_topk: 4
+  memory_len: 32
+  dec_layers: 2
+  dec_heads: 4
+  dec_ffn_dim: 128
+  dropout: 0.1
+  with_dn: false
+
+train:
+  output_dir: runs/pipe_cleaner
+  max_epochs: 100
+  lr: 0.0002
+  weight_decay: 0.0001
+  warmup_iters: 200
+  log_interval: 10
+  viz_interval: 5         # save training-viz image every 5 epochs
+  eval_interval: 5        # run validation every 5 epochs
+  device: auto
+  seed: 0
+
+eval:
+  max_eval_batches: 100   # ~400 val samples; fast sanity-check eval
+  pck_thresholds_mm: [50.0, 100.0, 150.0]
+  match_threshold_mm: 600.0

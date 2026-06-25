@@ -1,0 +1,62 @@
+# Small human_prior-aligned configuration
+data:
+  provider: human_prior_aligned
+  human_prior_repo: ../human_prior
+  human_prior_aligned_dirs:
+    - "G:\\My Drive\\FitnessData\\test_output_h36m"
+    - "G:\\My Drive\\FitnessData\\test_output_moyo"
+    - "G:\\My Drive\\FitnessData\\test_output_mpi3dhp"
+  # Set dataset roots that correspond to the sequences inside human_prior_aligned_dirs.
+  # Keep as null when not using that source type.
+  human_prior_h36m_dataset_path: "G:\\My Drive\\FitnessData\\Human3.6"
+  human_prior_moyo_dataset_path: "G:\\My Drive\\FitnessData\\MoYo"
+  human_prior_mpi_dataset_path: "G:\\My Drive\\FitnessData\\mpi_inf_3dhp"
+  image_height: 640
+  image_width: 640
+  num_cameras: 4
+  seq_len: 16
+  stride: 1
+  val_fraction: 0.2
+  split_seed: 0
+  batch_size: 2
+  num_workers: 0
+  max_people: 2
+
+model:
+  embed_dims: 128
+  num_joints: 12
+  backbone_type: yolo_pose
+  yolo_model_name: yolo11n-pose.pt
+  yolo_feature_index: 19
+  yolo_trainable: false
+  depth_num: 48
+  depth_start_mm: 500.0
+  depth_max_mm: 9000.0
+  lid_depth: true
+  num_queries: 16
+  dec_layers: 4
+  dec_heads: 4
+  dec_ffn_dim: 256
+  dropout: 0.1
+  num_propagated: 8
+  memory_topk: 8
+  memory_len: 256
+  with_dn: true
+  dn_scalar: 10
+  dn_noise_scale: 0.2
+  dn_split: 0.75
+  dn_weight: 1.0
+
+train:
+  output_dir: runs/small
+  max_epochs: 10
+  lr: 0.0002
+  weight_decay: 0.0001
+  warmup_iters: 50
+  log_interval: 5
+  device: auto
+  seed: 0
+
+eval:
+  pck_thresholds_mm: [50.0, 100.0, 150.0]
+  match_threshold_mm: 600.0
