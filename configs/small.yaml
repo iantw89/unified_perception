@@ -27,8 +27,9 @@ model:
   num_joints: 12
   backbone_type: yolo_pose
   yolo_model_name: yolo11n-pose.pt
-  yolo_feature_index: 19
+  yolo_feature_indices: [16, 19, 22]
   yolo_trainable: false
+  embed_dims: 128
   depth_num: 48
   depth_start_mm: 500.0
   depth_max_mm: 9000.0

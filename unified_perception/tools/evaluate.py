@@ -5,13 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 
 import torch
 from torch.utils.data import DataLoader
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from unified_perception.config import load_config  # noqa: E402
 from unified_perception.data import MultiViewPoseDataset, collate_batch  # noqa: E402

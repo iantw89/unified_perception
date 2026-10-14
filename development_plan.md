@@ -37,3 +37,16 @@ Basic image encoder, use one level of feature pyramid, auxiliary 2d-detection he
 1. Handle image distortion correctly
 2. Optimize floating point sizes of inputs/weights/etc
 3. Consider trying MLN
+4. Fix missing camera issue
+5. Fix incorrect offset issue (confirmed on some sequences)
+6. Generate training examples using subsets of complete camera set
+7. Fix the kludge of adding the human prior repo to the path of unified perception
+8. Fix the odd 1000x1002 resolution on some videos
+9. Fix the uneven data distribution between workers
+10. Make training resumable
+11. Profile forward/backward pass
+12. 
+
+
+# Next Experiments
+1. Try increasing the YOLO backbone size

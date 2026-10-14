@@ -1,34 +1,16 @@
-"""StreamPETR sparse head, re-implemented for multi-person 3D keypoints.
+"""StreamPETR / Detr3D sparse head for multi-person 3D keypoints.
 
-This is a faithful port of StreamPETR''s ``SparseHead`` (the streaming sparse
-query head) adapted to this codebase, with three deliberate modifications:
+This implements the Detr3D-style cross-attention from StreamPETR / RepDETR3D:
+rather than adding dense 3D position embeddings to all image tokens (PETR),
+the decoder projects each query's 3D reference point into the 2D image plane
+of every camera and bilinearly samples features there.  No
+``CameraPositionEncoder3D`` is needed; the projection geometry is handled
+inside ``Detr3DCrossAttn``.
 
-1. **No ego-motion compensation.**  The capture rig is static and the world
-   frame is fixed, so the streaming memory bank stores reference points in a
-   single world frame -- there is no ego-pose transform of the memory and no
-   ego-pose positional encoding.
-2. **3D keypoints instead of 3D boxes.**  Each query regresses ``J`` keypoints
-   (anchored at its 3D reference point) in normalised ``[0, 1]`` volume
-   coordinates rather than a 9/10-D bounding box.
-3. **Single class (person).**  Classification is a single "is a person" logit
-   (sigmoid), so there is no multi-class head.
-
-Retained StreamPETR machinery
------------------------------
-* a streaming **memory bank** (content + reference point + timestamp) that
-  propagates confident detections across frames;
-* **temporal alignment** -- memory queries are mixed into the current query set
-  and contribute extra self-attention keys, with a time embedding encoding
-  memory age;
-* **spatial alignment** -- a modulated LayerNorm injects per-view camera
-  calibration into the image tokens;
-* top-k **proposal propagation** into the memory bank;
-* **query denoising (DN)** during training, here noising the per-person 3D
-  reference (mid-hip) anchor.
-
-The head consumes per-frame image tokens (already produced by the YOLO backbone
-and 3D position encoder in the detector) and manages its own memory across the
-frames of a temporal window.
+Domain-specific adaptations vs the original StreamPETR:
+1. **No ego-motion** -- static capture rig, memory stored in world frame.
+2. **3D keypoints** instead of 3D boxes (each query regresses J joints).
+3. **Single class** -- one sigmoid logit per query.
 """
 
 from __future__ import annotations
@@ -63,32 +45,47 @@ class SparseHead(nn.Module):
         num_heads: int,
         ffn_dim: int,
         dropout: float,
+        num_cams: int,
+        num_levels: int,
+        num_pts: int,
+        position_range: List[float],
+        num_groups: int = 1,
         with_dn: bool = True,
         scalar: int = 10,
         noise_scale: float = 0.2,
         split: float = 0.75,
         time_step: float = 1.0,
+        use_mmcv_msda: bool = False,
     ):
         super().__init__()
-        self.embed_dims = embed_dims
-        self.num_joints = num_joints
-        self.num_query = num_query
+        self.embed_dims     = embed_dims
+        self.num_joints     = num_joints
+        self.num_query      = num_query
         self.num_propagated = num_propagated
-        self.memory_len = memory_len
+        self.memory_len     = memory_len
         self.topk_proposals = topk_proposals
-        self.num_layers = num_layers
-        self.with_dn = with_dn
-        self.scalar = scalar
+        self.num_layers     = num_layers
+        self.with_dn        = with_dn
+        self.scalar         = scalar
         self.dn_noise_scale = noise_scale
-        self.dn_split = split
-        self.time_step = float(time_step)
+        self.dn_split       = split
+        self.time_step      = float(time_step)
+
+        pc_range = torch.tensor(position_range, dtype=torch.float32)
+        self.register_buffer("pc_range", pc_range)
 
         self.decoder = TransformerDecoder(
             dim=embed_dims,
             num_layers=num_layers,
             num_heads=num_heads,
             ffn_dim=ffn_dim,
+            num_cams=num_cams,
+            num_levels=num_levels,
+            num_pts=num_pts,
             dropout=dropout,
+            pc_range=pc_range,
+            num_groups=num_groups,
+            use_mmcv_msda=use_mmcv_msda,
         )
 
         # Query positional embedding from a 3D reference point.
@@ -179,17 +176,18 @@ class SparseHead(nn.Module):
         self.memory_reference_point = torch.cat([rec_ref, self.memory_reference_point], dim=1)
         self.memory_timestamp = self.memory_timestamp - self.time_step
 
-    def temporal_alignment(self, query_pos, tgt, reference_points):
+    def integrate_temporal_queries(self, query_pos, tgt, reference_points):
         """Mix streaming memory queries into the current query set."""
         C = self.embed_dims
         temp_ref = self.memory_reference_point                       # (B, mem, 3)
-        temp_pos = self.query_embedding(pos2posemb3d(temp_ref, C // 2))
+        dtype = temp_ref.dtype
+        temp_pos = self.query_embedding(pos2posemb3d(temp_ref, C // 2).to(dtype))
         temp_memory = self.memory_embedding
 
         query_pos = query_pos + self.time_embedding(
-            pos2posemb1d(torch.zeros_like(reference_points[..., :1]), C)
+            pos2posemb1d(torch.zeros_like(reference_points[..., :1]), C).to(dtype)
         )
-        temp_pos = temp_pos + self.time_embedding(pos2posemb1d(self.memory_timestamp, C))
+        temp_pos = temp_pos + self.time_embedding(pos2posemb1d(self.memory_timestamp, C).to(dtype))
 
         if self.num_propagated > 0:
             tgt = torch.cat([tgt, temp_memory[:, : self.num_propagated]], dim=1)
@@ -206,9 +204,11 @@ class SparseHead(nn.Module):
     # Query denoising (DN)                                                #
     # ------------------------------------------------------------------ #
     def _dn_pad_size(self, gt_valid) -> Tuple[int, int]:
-        """single_pad = max #people over the batch & time; pad = single_pad * scalar."""
-        per_frame = gt_valid.reshape(-1, gt_valid.shape[-1]).sum(dim=-1)
-        single_pad = int(per_frame.max().item()) if per_frame.numel() else 0
+        """single_pad = max_people (static padded dimension
+        gt_valid.shape[-1] == P == cfg.data.max_people: GT tensors are always
+        padded to this fixed size
+        """
+        single_pad = gt_valid.shape[-1]  # P = max_people (static)
         return single_pad, single_pad * self.scalar
 
     def _dn_attn_mask(self, pad_size, single_pad, device):
@@ -322,22 +322,35 @@ class SparseHead(nn.Module):
     # ------------------------------------------------------------------ #
     # Forward (whole temporal window)                                     #
     # ------------------------------------------------------------------ #
-    def forward(self, feats, pos, mln_input, gt_kpts_norm=None, gt_valid=None):
+    def forward(
+        self,
+        feats:        torch.Tensor,                      # (B, T, N*sum_L, C)
+        mln_input:    torch.Tensor,                      # (B, T, N*sum_L, 14)
+        world2img:    torch.Tensor,                      # (B, T, N, 4, 4)
+        spatial_shapes: list,                            # [(Hp_l, Wp_l), ...]
+        image_hw:     Tuple[int, int],                   # (H,  W)
+        gt_kpts_norm: Optional[torch.Tensor] = None,     # (B, T, P, J, 3)
+        gt_valid:     Optional[torch.Tensor] = None,     # (B, T, P)
+    ):
         """Run the streaming head over a temporal window.
 
         Args:
-            feats: (B, T, M, C) per-frame image tokens (pre-processed by detector).
-            pos:   (B, T, M, C) per-frame 3D position embeddings.
-            mln_input: (B, T, M, 14) per-token camera calibration code.
+            feats:         (B, T, N*sum_L, C)  spatially-flattened per-camera tokens.
+            mln_input:     (B, T, N*sum_L, 14) per-token camera calibration code.
+            world2img:     (B, T, N, 4, 4) world→image projection matrices.
+            spatial_shapes: [(Hp_l, Wp_l), ...]  per-level spatial dimensions.
+            image_hw:      (H,  W)         original image dimensions (pixels).
+            gt_kpts_norm:  (B, T, P, J, 3) normalised GT keypoints (DN only).
+            gt_valid:      (B, T, P)       bool validity mask (DN only).
 
-            gt_kpts_norm: (B, T, P, J, 3) normalised GT keypoints (DN only).
-            gt_valid: (B, T, P) bool (DN only).
         Returns:
             cls_scores: (L, B, T, Qm, 1)
             keypoints:  (L, B, T, Qm, J, 3) normalised [0, 1]
             dn_meta:    dict for the DN loss, or None.
         """
-        B, T, M, C = feats.shape
+        B, T, NsumL, C = feats.shape
+        N    = world2img.shape[2]
+        sumL = NsumL // N                                # total tokens per camera across all levels
         device = feats.device
         self.reset_memory()
 
@@ -355,7 +368,7 @@ class SparseHead(nn.Module):
             prev_exists = feats.new_zeros(B) if t == 0 else feats.new_ones(B)
             self.pre_update_memory(B, prev_exists, device, feats.dtype)
 
-            ref = self.reference_points.weight
+            ref = torch.sigmoid(self.reference_points.weight)
             if use_dn:
                 padded_ref, attn_mask, dn_info = self.prepare_for_dn(
                     B, ref, gt_kpts_norm[:, t], gt_valid[:, t], single_pad, pad_size
@@ -364,20 +377,27 @@ class SparseHead(nn.Module):
                 padded_ref = ref.unsqueeze(0).repeat(B, 1, 1)
                 attn_mask, dn_info = None, None
 
-            query_pos = self.query_embedding(pos2posemb3d(padded_ref, C // 2))
+            query_pos = self.query_embedding(pos2posemb3d(padded_ref, C // 2).to(feats.dtype))
             tgt = torch.zeros_like(query_pos)
-            tgt, query_pos, reference_points, temp_memory, temp_pos = self.temporal_alignment(
+            tgt, query_pos, reference_points, temp_memory, temp_pos = self.integrate_temporal_queries(
                 query_pos, tgt, padded_ref
             )
 
+            # Spatial alignment: inject camera calibration into per-token feats.
+            # feats[:, t]: (B, N*sum_L, C); reshape to (B*N, sum_L, C) for the decoder.
             frame_feat = self.spatial_alignment(feats[:, t], mln_input[:, t])
-            frame_pos = pos[:, t]
+            frame_feat_bn = frame_feat.view(B, N, sumL, C).reshape(B * N, sumL, C)
+
+            w2i_t = world2img[:, t]                      # (B, N, 4, 4)
 
             dec = self.decoder(
                 tgt,
                 query_pos,
-                frame_feat,
-                frame_pos,
+                frame_feat_bn,
+                reference_points,
+                w2i_t,
+                spatial_shapes,
+                image_hw,
                 temp_memory=temp_memory,
                 temp_pos=temp_pos,
                 attn_mask=attn_mask,
@@ -385,7 +405,7 @@ class SparseHead(nn.Module):
 
             cls, kpts = self._apply_heads(dec, reference_points)
 
-            match_cls = cls[:, :, pad_size:]
+            match_cls  = cls[:, :, pad_size:]
             match_kpts = kpts[:, :, pad_size:]
             self.post_update_memory(match_cls, match_kpts, dec[:, :, pad_size:])
 
@@ -399,15 +419,15 @@ class SparseHead(nn.Module):
                 dn_person.append(dn_info["is_person"])
 
         cls_scores = torch.stack(cls_frames, dim=2)   # (L, B, T, Qm, 1)
-        keypoints = torch.stack(kpt_frames, dim=2)    # (L, B, T, Qm, J, 3)
+        keypoints  = torch.stack(kpt_frames, dim=2)   # (L, B, T, Qm, J, 3)
 
         dn_meta = None
         if use_dn:
             dn_meta = {
-                "dn_cls": torch.stack(dn_cls, dim=2),       # (L, B, T, pad, 1)
-                "dn_kpts": torch.stack(dn_kpts, dim=2),     # (L, B, T, pad, J, 3)
-                "target_kpts": torch.stack(dn_tgt, dim=1),  # (B, T, pad, J, 3)
-                "valid": torch.stack(dn_valid, dim=1),      # (B, T, pad)
-                "is_person": torch.stack(dn_person, dim=1), # (B, T, pad)
+                "dn_cls":       torch.stack(dn_cls,    dim=2),  # (L, B, T, pad, 1)
+                "dn_kpts":      torch.stack(dn_kpts,   dim=2),  # (L, B, T, pad, J, 3)
+                "target_kpts":  torch.stack(dn_tgt,    dim=1),  # (B, T, pad, J, 3)
+                "valid":        torch.stack(dn_valid,  dim=1),  # (B, T, pad)
+                "is_person":    torch.stack(dn_person, dim=1),  # (B, T, pad)
             }
         return cls_scores, keypoints, dn_meta

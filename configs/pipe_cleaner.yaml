@@ -18,46 +18,52 @@ data:
   num_cameras: 4
   seq_len: 4
   stride: 1
-  val_fraction: 0.2
+  val_fraction: 0.1
   split_seed: 0
-  batch_size: 4        # optimized for RTX 4090 24 GB (4 x T4 x N4 = 64 images/step)
-  num_workers: 0
+  batch_size: 16        # num images = num_cameras * batch_size * seq_len
+  num_workers: 8       # data on local NVMe SSD; bottleneck is CPU decode — more workers helps
   max_people: 1
-  max_samples_per_epoch: 1000  # 250 batches/epoch; ~30-60 s on GPU
+  gpu_decode: false   # decode video frames on GPU (requires torchcodec with GPU support)
+  use_shuffle_buffer: true
+  buffer_frames: 1024  # 4 segs × ~256 frames/seg per worker — ~2.9 GB RSS
+  min_buffer_seg: 4   # enforce shuffle diversity by preventing one large segment from dominating
+  prefetch_queue_depth: 1  # explicit: 4 pre-staged chunks beyond the pool (was 0=auto before)
 
 model:
   num_joints: 12
+  embed_dims: 256
   backbone_type: yolo_pose
   yolo_model_name: yolo11n-pose.pt
-  yolo_feature_index: 19
+  yolo_feature_indices: [16, 19, 22]
   yolo_trainable: false   # YOLO frozen for pipe-cleaner
-  depth_num: 24
-  depth_start_mm: 200.0
-  depth_max_mm: 9000.0
-  lid_depth: true
-  num_queries: 16
+  num_queries: 64
   num_propagated: 4
   memory_topk: 4
   memory_len: 32
-  dec_layers: 2
-  dec_heads: 4
-  dec_ffn_dim: 128
+  dec_layers: 6
+  dec_heads: 8
+  dec_ffn_dim: 2048
+  dec_num_pts: 13
+  dec_groups: 8
   dropout: 0.1
-  with_dn: false
+  with_dn: true
 
 train:
-  output_dir: runs/pipe_cleaner
+  output_dir: runs/pipe_cleaner_rangefix
   max_epochs: 100
-  lr: 0.0002
+  lr: 0.0004  # 4e-4
   weight_decay: 0.0001
   warmup_iters: 200
   log_interval: 10
-  viz_interval: 5         # save training-viz image every 5 epochs
-  eval_interval: 5        # run validation every 5 epochs
+  viz_batch_interval: 5000  # save viz every n global steps (0 = off)
+  eval_interval: 10        # run validation every n epochs
   device: auto
   seed: 0
+  # Standard DETR-family grad-clip without a GradScaler.  StreamPETR uses 35.0
+  # only because FP16+GradScaler skips the entire step on any gradient overflow,
+  # providing implicit protection that we don't have with bfloat16.
+  grad_clip: 1.0
 
 eval:
-  max_eval_batches: 100   # ~400 val samples; fast sanity-check eval
   pck_thresholds_mm: [50.0, 100.0, 150.0]
   match_threshold_mm: 600.0

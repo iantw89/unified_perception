@@ -16,8 +16,9 @@ from torchvision.ops import sigmoid_focal_loss
 from .matcher import hungarian_match
 
 
-class SetCriterion:
+class SetCriterion(torch.nn.Module):
     def __init__(self, cfg_model):
+        super().__init__()
         m = cfg_model
         self.cost_class = m.cost_class
         self.cost_kpt = m.cost_kpt
@@ -27,7 +28,7 @@ class SetCriterion:
         self.gamma = m.focal_gamma
         self.dn_weight = getattr(m, "dn_weight", 1.0)
 
-    def __call__(self, cls_scores, keypoints, gt_keypoints, gt_valid, dn_meta=None):
+    def forward(self, cls_scores: torch.Tensor, keypoints: torch.Tensor, gt_keypoints: torch.Tensor, gt_valid: torch.Tensor, dn_meta=None):
         """Compute the total loss and a metrics dict.
 
         Args:
@@ -105,7 +106,7 @@ class SetCriterion:
         cls_target = person.float().unsqueeze(-1)          # (B, T, P, 1)
         cls_weight = valid.float().unsqueeze(-1)           # supervise filled slots only
         pmask = valid & person                             # (B, T, P)
-        num_pos = max(int(pmask.sum().item()), 1)
+        num_pos = torch.clamp(pmask.sum().int(), min=1)
 
         total_cls = torch.zeros((), device=device)
         total_kpt = torch.zeros((), device=device)

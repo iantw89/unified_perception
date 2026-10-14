@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../human_prior"
+		}
+	],
+	"settings": {
+		"extensions.supportNodeGlobalNavigator": true
+	}
+}

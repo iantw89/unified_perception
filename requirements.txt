@@ -5,9 +5,11 @@ numpy>=1.24
 opencv-python>=4.8
 scipy>=1.10
 pyyaml>=6.0
-tensorboard>=2.13
+tensorboard
 tqdm>=4.65
 matplotlib>=3.7
 ultralytics>=8.3
 torchcodec>=0.1
 torch-tb-profiler
+triton-windows ; sys_platform == 'win32'
+triton ; sys_platform != 'win32'
