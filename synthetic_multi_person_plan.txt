@@ -1,0 +1,356 @@
+SYNTHETIC MULTI-PERSON DATA AUGMENTATION PLAN
+==========================================
+
+Status: Design confirmed by the user; no implementation authorized by this plan.
+Date: 2026-10-22
+
+1. OBJECTIVE AND AGREED SCOPE
+---------------------------
+
+Improve multi-person 3D pose estimation while preserving single-person
+performance. Generate coherent multi-view, temporal RGB examples containing
+multiple people, with corresponding calibrated 3D targets.
+
+Initial supported scene size: 1-8 people. Retain original single-person samples.
+Allow partial and complete image occlusion, but reject physical collisions using
+conservative 3D body proxies. Always include every composed person as a target,
+even when fully hidden. Visibility is diagnostic, not a supervision filter.
+
+Compose only within the same verified capture geometry: camera rig, calibration,
+world frame, image geometry, distortion convention, and compatible frame timing.
+The same dataset name is not sufficient evidence of compatibility.
+
+Keep source people at their original world and image positions. Do not translate,
+rotate, resize, or otherwise reposition people without generating the correct
+corresponding pixels. Different clips of the same actor may appear together;
+assign distinct synthetic instance IDs while preserving original subject IDs.
+
+Preserve temporal motion and provenance. Do not add a tracking loss, change the
+task to tracking, or add a post-hoc tracker. Measure current query-ID continuity.
+
+Generate synthetic train, validation, and test examples independently within
+their source splits. Retain untouched original evaluation. Increased training
+compute is expected and will be measured explicitly.
+
+2. CURRENT REPOSITORY EVIDENCE AND LIMITATIONS
+--------------------------------------------
+
+Relevant existing surfaces:
+- README.md: calibrated dataset contract and intended multi-person behavior.
+- unified_perception/config.py and configs/: person limits, temporal windows,
+  camera inputs, model capacity, and training configuration.
+- unified_perception/models/detector.py: calibrated multi-view temporal model.
+- unified_perception/models/matcher.py: per-frame Hungarian set assignment.
+- unified_perception/models/losses.py: focal classification, pose regression,
+  auxiliary decoder supervision, and query-denoising losses.
+- unified_perception/engine/metrics.py and engine/evaluate.py: multi-person
+  matching, detection metrics, MPJPE, and PCK.
+- development_plan.md: known camera/offset issues and camera-subset work.
+
+The model already has multiple queries and variable-cardinality targets.
+Multi-person support needs verification, not an assumed architecture rewrite.
+
+The documented calibration uses X_cam = R @ X_world + T, with coordinates in
+millimetres. Preserve this convention through collision checks and projection.
+
+The documented dataset contract includes RGB, calibration, 3D joints, and valid
+person slots. Inspection of the sibling human_prior alignment pipeline found
+joint/calibration outputs and source traceability, but no established person
+mask, depth-map, mesh, or textured-body rendering pipeline.
+
+Sparse 3D joints do not establish body silhouettes or exact pixel depths.
+Sorting people solely by pelvis depth cannot correctly resolve interleaved
+limbs. Full surface-depth compositing is not promised by this first version.
+
+The current checkout lacks unified_perception/data/, although documentation and
+training reference it. Identifying or recovering that package is a prerequisite.
+Do not silently replace it with a speculative new provider implementation.
+
+3. DELIVERY PHASE A: DATA AND BASELINE AUDIT
+------------------------------------------
+
+3.1 Recover the data path
+- Identify the intended data package/revision and recover it through a separate,
+  explicit prerequisite if needed.
+- Confirm actual provider outputs, batching, temporal windows, padding, person
+  validity, calibration transformations, image resizing, and split behavior.
+- Keep changes in this repository; do not incidentally rewrite human_prior.
+
+3.2 Inventory eligible assets and capture groups
+- Inventory H36M, MoYo, and MPI-Inf-3DHP sources supported by the existing setup.
+- Record source dataset, subject, sequence, camera IDs, timestamps/frame indices,
+  frame rates, world units, coordinate convention, K/R/T, distortion, and image
+  dimensions. Hash canonical calibration/image-transform metadata.
+- Verify geometric compatibility rather than inferring it from matching names.
+- Account for alignment offsets and downsampling when mapping mocap to RGB.
+  For example, MPI's alignment pipeline uses camera 0 as its reference frame
+  and can downsample synchronous 25 FPS inputs to 12.5 FPS.
+- Validate projection and normalization bounds before considering composition.
+- Audit real calibrated multi-person benchmark availability and compatibility.
+  Collecting a new real dataset requires a separate scope decision.
+
+3.3 Freeze source splits before extracting windows
+- Preserve the dataset's subject/sequence split protocol.
+- Group related source material before windowing so overlapping/near-duplicate
+  windows cannot cross splits. Respect subject isolation where required.
+- Verify source clips, cached assets, recipes, and benchmark examples inherit
+  their source split. No training donor or base may enter validation/test.
+- Establish an explicit test split if the recovered provider only defines
+  train/validation, documenting its dataset-appropriate grouping policy.
+
+3.4 Establish baselines
+- Record config, revision, seeds, preprocessing, checkpoint, thresholds, and
+  original single-person metrics before augmentation.
+- Check baseline query capacity and normalization volume against all targets.
+- Identify feasibility blockers before scheduling expensive generation/training.
+
+Exit gate: a working original-data path, verified source grouping/splits, and a
+reproducible baseline. Missing assets or inconsistent calibration block progress.
+
+4. DELIVERY PHASE B: MODEL, LOSS, AND METRIC CORRECTNESS
+-----------------------------------------------------
+
+Use existing tests/tooling where present. Add focused tests covering:
+- 0, 1, 2, and 8 valid people, variable counts in a batch, and padded slots.
+- Permutation-invariant matching and losses; duplicate predictions and misses.
+- All decoder layers, denoising groups, and temporal frames.
+- Finite losses/gradients; matched/unmatched query classification; valid target
+  counting; loss scale as person count, padding, and decoder depth change.
+- Audit positive-count normalization and layer averaging together; avoid
+  accidentally averaging by decoder depth twice. Fix demonstrated correctness
+  errors, not speculative new objectives, and use consistent code for controls.
+- Query/denoising capacity, truncation, memory selection, and effective batch
+  size at eight people. Reject capacity overflow rather than dropping labels.
+- Memory reset at clip boundaries and coherent state within a temporal window.
+- Confidence filtering and geometric match thresholds in physical units.
+- Empty prediction/target cases, all-missed frames, false positives, person
+  count errors, and preservation of query indices through evaluation filtering.
+
+Use tiny controlled rendered fixtures for known projection/occlusion cases.
+Tensor-only fixtures may test matching/loss logic; they must not become training
+examples with invisible extra labels added to unchanged single-person RGB.
+
+Preserve focal/pose/Hungarian objectives unless a demonstrated implementation
+bug requires a tightly scoped correction. No tracking objective is added.
+
+Exit gate: verified multi-person plumbing and an upper-bound memory smoke test
+before training on composed RGB.
+
+5. DELIVERY PHASE C: EXTRACTION AND COMPOSITING PILOT
+--------------------------------------------------
+
+5.1 Locally extract person foregrounds
+- Select and pin a locally executed segmentation method and model weights;
+  review dependency/license compatibility before introducing them.
+- Extract every participating source person's mask, including the base person,
+  at the exact RGB frames/cameras used by the provider.
+- Cache masks or mattes with source, model, preprocessing, and version hashes.
+- Check masks against projected joints, temporal continuity, image borders,
+  disconnected artifacts, and obvious background contamination.
+- Reject unrepresentable source occlusion, missing foregrounds, bad masks, and
+  calibration/alignment errors with explicit reason codes.
+- Do not upload source images or code to an external service.
+
+5.2 Choose coherent source trajectories
+- Choose a base temporal window and compatible donor windows once per recipe.
+- Use compatible frame timing and window duration; no independent per-frame
+  resampling or unvalidated temporal warping.
+- Keep native world trajectories, pixel positions, and the base camera set.
+- Check all trajectories against the model's supported spatial bounds.
+- Reject cross-person torso/limb proxy intersections throughout the window.
+  Use conservative anatomical volumes and documented margins in millimetres.
+  Check swept/interpolated movement between sampled frames where necessary.
+- This is proxy-based collision avoidance, not proof of exact clothing/body
+  surface separation. Exact guarantees require additional geometry.
+
+5.3 Composite each camera and frame consistently
+- Use the original base RGB as the background canvas; keep the base person in
+  place. There is no need to erase/reposition the base person in this design.
+- Use masks and conservative projected geometry/depth bounds to establish
+  per-camera foreground ordering wherever person masks overlap.
+- Ordering may differ between cameras and change over time when geometrically
+  justified. Check temporal consistency rather than imposing one global order.
+- Paste donor foregrounds in the accepted order, protecting the original base
+  foreground wherever it should occlude a donor.
+- Reject ambiguous overlaps, ordering cycles, and interleaving that the
+  available geometry cannot resolve reliably. Do not use pelvis sorting as an
+  unconditional fallback.
+- Do not paste donor backgrounds or silently inpaint unseen body surfaces.
+- Apply shared image preprocessing consistently to masks, pixels, and cameras.
+- Audit cutout edges, source occluders, donor shadows, lighting differences,
+  background mismatch, and temporal flicker. This remains approximate image
+  compositing, not physically correct relighting or 3D rendering.
+
+5.4 Produce coherent labels
+- Stack each source trajectory's unchanged world-space joints into person slots.
+- Every inserted person remains a valid target at every composed frame,
+  including full occlusion. Padding is invalid; occlusion is not padding.
+- Preserve all joints of valid people; no visibility-based loss weighting.
+- Assign stable synthetic instance IDs within the clip; retain original
+  subject, sequence, and frame provenance separately.
+- Compute visible mask fractions per camera after composition for diagnostics.
+  Do not reject a scene merely because a person is visually hidden.
+- Distinguish requested, successfully inserted, and visible person counts.
+
+5.5 Inspect and decide feasibility
+- Start with two-person clips, inspect synchronized multi-camera videos and
+  projected GT overlays, then expand to larger counts.
+- Include all eligible dataset families/capture groups and representative
+  motions, overlap patterns, camera angles, and counts in the pilot review.
+- All automated invariants must pass. At least 95% of manually reviewed pilot
+  clips must pass the documented visual rubric; exclude failed examples.
+- Record reviewed sample IDs, rejection reasons, yields, time, and storage.
+- If native trajectories or reliable masks cannot support useful combinations,
+  stop and revisit scope. Do not silently weaken geometry/quality constraints.
+
+Exit gate: a quality-approved pilot with demonstrated generation yield. Surface
+rendering, arbitrary person relocation, and cross-rig mixing remain out of scope.
+
+6. DELIVERY PHASE D: REPRODUCIBLE GENERATION AND DATA LOADING
+----------------------------------------------------------
+
+Cache expensive extraction assets offline. Assemble training RGB from lightweight
+composition recipes rather than duplicating every full-resolution input image.
+
+A versioned recipe records:
+- Split, dataset/capture-group ID, source subject/sequence IDs, and frame maps.
+- Base/donor roles, synthetic instance IDs, camera identities, calibration and
+  image-transform hashes, extraction/cache versions, and generation seed.
+- Geometry/proxy parameters, accepted per-frame/per-camera ordering, and quality
+  checks. Store visibility diagnostics or regenerate them deterministically.
+
+Requirements:
+- Deterministic reconstruction across runs and data-loader worker counts.
+- Split/version-aware caches; stale or missing required assets fail explicitly.
+- Source-independent split checks on both the base and every donor.
+- Rejection statistics and bounded sampling attempts; no infinite retry loops.
+- No silent fallback from a requested multi-person sample to a single person.
+  Mark unsupported strata and require an explicit experiment configuration
+  change if the agreed training mixture cannot be achieved.
+- Deduplicate equivalent recipes, including donor permutations that produce
+  the same output; report reuse/overlapping-window correlation honestly.
+- Freeze validation/test manifests and processing versions before final runs.
+- Support materializing benchmark examples and inspection videos as needed.
+
+Integrate with the recovered provider/dataset contract and existing collation,
+normalization, image transforms, configuration, and visualization patterns.
+Make composition opt-in so existing original-data behavior remains available.
+
+7. DELIVERY PHASE E: SCALE AND TRAINING EXPERIMENTS
+------------------------------------------------
+
+Initial target: 10 times as many distinct composition recipes as eligible
+original training windows, subject to the demonstrated feasible combinations.
+This does not create independent new people, appearances, or capture settings.
+
+Training sampling:
+- 25% original single-person examples; 75% composed examples.
+- Sample requested counts 2-8 evenly where feasible.
+- Progress from verified two-person generation to the full supported range.
+- Report achieved count distributions and supported groups in every split.
+- Do not manufacture count coverage using duplicate recipes or unsafe pasting.
+
+Run and report:
+A. Existing original-data baseline at the original training budget.
+B. Original-only control at 3 times the baseline optimizer steps.
+C. Augmented training at the same extended budget as B.
+
+Keep effective batch size, model, optimizer settings, and preprocessing comparable
+for B/C; document necessary memory-related changes. Express schedules in optimizer
+steps, not an ambiguous epoch over a much larger recipe space. Preserve comparable
+learning-rate schedules for B/C and select checkpoints using validation only.
+
+Record total steps, examples/people seen, hardware, wall time, peak memory,
+segmentation/generation overhead, storage, and source/recipe reuse.
+Consider further compute expansion only after evaluating this staged experiment.
+
+8. EVALUATION AND IDENTITY DIAGNOSTICS
+------------------------------------
+
+Evaluate A/B/C on:
+- Untouched original evaluation, including single-person regression results.
+- Frozen source-isolated synthetic validation/test.
+- A compatible held-out real multi-person benchmark, if available.
+
+Report precision, recall, F1, count errors, matched-person MPJPE/PCK, matched
+coverage, and false positives/negatives. Report person-count, occlusion/visibility,
+dataset/capture-group, and camera-count breakdowns. Keep fully hidden targets in
+the headline denominator. Matched-pose error alone cannot show detection quality.
+
+Report no-match cases explicitly as undefined pose error with zero matched
+coverage, not as a perfect zero-error result. Keep meaningful detection metrics.
+
+Identity diagnostics:
+- Preserve original output query indices when confidence filtering predictions.
+- Associate accepted predictions with GT instances using the same documented
+  per-frame geometric matching/gating as detection evaluation.
+- Measure query-ID switches, matched/unmatched fragments, and matched-frame
+  coverage per GT synthetic instance; report normalized rates and raw counts.
+- Define a switch as a change in associated query index between successive
+  accepted associations within a clip, including reassociation after a gap.
+- Count matched runs separated by unmatched frames as separate fragments.
+- Report misses separately; an undetected person is not a stable identity.
+- Reset associations at scene/window boundaries; do not concatenate unrelated
+  or overlapping evaluation windows into a fictitious long track.
+- Query indices are output-slot continuity diagnostics, not learned identity
+  guarantees. Query propagation/reordering limitations must be documented.
+
+Tune confidence thresholds/checkpoint selection on validation, not test.
+Freeze recipes, thresholds, metric definitions, and acceptance rules before
+opening final test results. Include repeated-seed variability when feasible.
+
+9. ACCEPTANCE GATES AND INTERPRETATION
+------------------------------------
+
+Data:
+- All automated geometry, provenance, label/pixel consistency, capacity, and
+  reproducibility checks pass.
+- No source-split leakage.
+- At least 95% pilot visual-review pass rate; failed examples excluded.
+- Requested versus achieved scale/count coverage reported without concealment.
+
+Model gates, finalized on validation before test:
+- Single-person F1 decreases by no more than 2 percentage points.
+- Single-person MPJPE increases by no more than 5% relative.
+- Synthetic multi-person F1 improves by at least 5 percentage points.
+- Synthetic matched-pose MPJPE increases by no more than 5% relative, with
+  coverage and missed-person rates reported alongside it.
+
+Use the original-budget baseline A for the agreed baseline gates. Report C
+versus extended-budget control B as well; gains over A alone do not establish
+that augmentation, rather than more training compute, caused the improvement.
+These thresholds are decision criteria, not predicted outcomes.
+
+A claim of improved real-crowd generalization additionally requires improvement
+on a compatible held-out real multi-person benchmark. If unavailable, state
+clearly that results demonstrate original-data retention and synthetic-scene
+performance only. Synthetic benchmark gains do not prove real-scene realism.
+
+10. IMPLEMENTATION DELIVERABLES AND STOP CONDITIONS
+-------------------------------------------------
+
+After separate authorization to implement:
+1. Resolve the data-package prerequisite and document actual source contracts.
+2. Add focused multi-person model/loss/metric correctness tests and necessary
+   demonstrated bug fixes, without adding a tracking objective.
+3. Add local foreground extraction, versioned caches, geometry checks, recipe
+   generation, and a two-person visual pilot.
+4. Integrate opt-in composition into training and fixed synthetic evaluation;
+   support always-valid targets, provenance, and query-continuity reporting.
+5. Add count/camera/occlusion diagnostics and extend to feasible 2-8-person data.
+6. Run the staged controls and extended-budget training/evaluation experiments.
+7. Update directly related dataset/configuration/evaluation documentation with
+   generation commands, limitations, reproducibility, and measured costs.
+
+Use existing build/test tools and the smallest relevant tests, then run an
+end-to-end tiny generation/loading/forward/loss/evaluation smoke test before
+large generation or training. Verify original-data behavior remains available.
+
+Stop and revisit the design if calibration/splits cannot be established, the
+data package cannot be recovered, masks/orderings are unreliable, useful
+collision-free native combinations are too scarce, or acceptance gates fail.
+Do not silently introduce rendering, unsupported world transforms, visibility
+filtering, changed learning objectives, or cross-split source reuse.
+
+This document is the planning deliverable. No model, data, dependency, or
+training implementation has been performed as part of writing it.
