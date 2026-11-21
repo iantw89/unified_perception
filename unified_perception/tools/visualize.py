@@ -104,6 +104,7 @@ def main() -> None:
                 cls_scores, kpts_norm, _, dets_2d = model(
                     imgs, world2img, intrinsics, gt_norm, gt_valid,
                     return_2d=True,
+                    camera_valid=None if "camera_valid" not in batch else batch["camera_valid"].to(device),
                 )
 
         B = imgs.shape[0]

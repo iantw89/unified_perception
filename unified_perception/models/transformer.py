@@ -37,6 +37,22 @@ except ImportError:
     MMCVMSDAfn = None
     MMCV_MSDA_AVAILABLE = False
 
+_SHAPE_CACHE: dict = {}
+
+
+def msda_inputs(feats: torch.Tensor, spatial_shapes: list, groups: int) -> tuple:
+    """MMCV MSDA inputs of one frame: float32 value (B*N, sum_L, G, C/G) and cached
+    (S, 2) shapes / (S,) level starts (no per-call host-to-device copy, which syncs)."""
+    key = (tuple(tuple(int(v) for v in hw) for hw in spatial_shapes), feats.device)
+    cached = _SHAPE_CACHE.get(key)
+    if cached is None:
+        shapes = torch.tensor([list(hw) for hw in key[0]], dtype=torch.long, device=feats.device)
+        starts = torch.cat([shapes.new_zeros(1), (shapes[:, 0] * shapes[:, 1]).cumsum(0)[:-1]])
+        cached = _SHAPE_CACHE[key] = (shapes, starts)
+    BN, L, C = feats.shape
+    return (feats.reshape(BN, L, groups, C // groups).float(),) + cached
+
+
 class Detr3DCrossAttn(nn.Module):
     """3D-projection feature-sampling cross-attention (multi-scale).
 
@@ -107,6 +123,8 @@ class Detr3DCrossAttn(nn.Module):
         world2img:        torch.Tensor,  # (B, N, 4, 4)
         spatial_shapes:   list,          # [(Hp_0, Wp_0), (Hp_1, Wp_1), ...]
         image_hw:         Tuple[int, int],  # (H, W) original image pixels
+        camera_valid:     Optional[torch.Tensor] = None,  # (B, N)
+        msda:             Optional[tuple] = None,  # (value f32, shapes, level_start) per frame
     ) -> torch.Tensor:                   # (B, Q, C)
         B, Q, C = query.shape
         N       = world2img.shape[1]
@@ -133,6 +151,8 @@ class Detr3DCrossAttn(nn.Module):
             & (u_n > 0) & (u_n < 1)
             & (v_n > 0) & (v_n < 1)
         )  # (B, N, Q, P)
+        if camera_valid is not None:
+            valid = valid & camera_valid[:, :, None, None]
 
         # ---- Attention weights (B, Q, G, N*S*P) — StreamPETR DFA style ----
         G       = self.num_groups
@@ -154,7 +174,9 @@ class Detr3DCrossAttn(nn.Module):
                  .reshape(B, Q, N * S * P, 1)
         )
         weights = weights.masked_fill(~valid_flat, float("-inf"))
-        weights = weights.softmax(dim=-2).nan_to_num(0.0)    # (B, Q, N*S*P, G)
+        # No visible sampling points: avoid an all--inf softmax and NaN gradients.
+        weights = torch.where(valid_flat.any(dim=-2, keepdim=True), weights, 0.0)
+        weights = weights.softmax(dim=-2).masked_fill(~valid_flat, 0.0)
         weights = weights.permute(0, 1, 3, 2)                # (B, Q, G, N*S*P)
 
         # ---- Feature sampling (dispatch PyTorch or MMCV CUDA) --------------
@@ -163,7 +185,7 @@ class Detr3DCrossAttn(nn.Module):
             output = self._forward_mmcv(
                 feats, u_n, v_n,
                 weights,
-                spatial_shapes, B, N, Q, C, S, P, query.dtype,
+                spatial_shapes, B, N, Q, C, S, P, query.dtype, msda,
             )
         else:
             output = self._forward_pytorch(
@@ -225,6 +247,7 @@ class Detr3DCrossAttn(nn.Module):
         spatial_shapes: list,
         B: int, N: int, Q: int, C: int, S: int, P: int,
         out_dtype: torch.dtype,
+        msda: Optional[tuple] = None,
     ) -> torch.Tensor:                  # (B, Q, C)
         """MMCV CUDA MSDA kernel path.
 
@@ -239,19 +262,11 @@ class Detr3DCrossAttn(nn.Module):
         group_dims = C // G
         device     = feats.device
 
-        # value: (B*N, sum_L, G, group_dims) — channels split into G groups
-        value = feats.view(B * N, feats.shape[1], G, group_dims).float()
-
-        # spatial_shapes: (S, 2) int64  [H, W] per level
-        shapes_t = feats.new_tensor(
-            [[h, w] for h, w in spatial_shapes], dtype=torch.long,
-        )                                                    # (S, 2)
-
-        # level_start_index: (S,) int64
-        level_start_idx = torch.cat([
-            shapes_t.new_zeros(1),
-            (shapes_t[:, 0] * shapes_t[:, 1]).cumsum(0)[:-1],
-        ])                                                   # (S,)
+        if msda is None:
+            msda = msda_inputs(feats, spatial_shapes, G)
+        # value: (B*N, sum_L, G, group_dims) float32 — shared by every layer of the frame
+        # (one conversion, and autograd saves it once); shapes / level starts are cached.
+        value, shapes_t, level_start_idx = msda
 
         # sampling_locations: (B*N, Q, G, S, P, 2) in [0, 1]
         # The same 2D location is used at every pyramid level and group.
@@ -340,6 +355,8 @@ class DecoderLayer(nn.Module):
         temp_memory:      Optional[torch.Tensor] = None,  # (B, M, C)
         temp_pos:         Optional[torch.Tensor] = None,  # (B, M, C)
         attn_mask:        Optional[torch.Tensor] = None,
+        camera_valid:     Optional[torch.Tensor] = None,
+        msda:             Optional[tuple] = None,
     ) -> torch.Tensor:
         def _wp(x, p): return x if p is None else x + p
 
@@ -357,6 +374,7 @@ class DecoderLayer(nn.Module):
         q2    = self.cross_attn(
             query, query_pos, feats, reference_points,
             self.pc_range, world2img, spatial_shapes, image_hw,
+            camera_valid=camera_valid, msda=msda,
         )
         query = self.norm2(query + self.dropout(q2))
 
@@ -411,14 +429,26 @@ class TransformerDecoder(nn.Module):
         temp_memory:      Optional[torch.Tensor] = None,
         temp_pos:         Optional[torch.Tensor] = None,
         attn_mask:        Optional[torch.Tensor] = None,
+        camera_valid:     Optional[torch.Tensor] = None,
     ) -> torch.Tensor:                            # (L, B, Q, C)
         intermediate = []
+        cross = self.layers[0].cross_attn
+        msda = None
+        if cross.use_mmcv_msda and MMCV_MSDA_AVAILABLE and feats.is_cuda:
+            msda = msda_inputs(feats, spatial_shapes, cross.num_groups)
+        if attn_mask is not None and attn_mask.dtype == torch.bool:
+            # Additive float mask built once per frame instead of in every layer's attention.
+            mask_dtype = torch.get_autocast_dtype(query.device.type) if torch.is_autocast_enabled(query.device.type) else query.dtype
+            attn_mask = torch.zeros(attn_mask.shape, dtype=mask_dtype, device=query.device).masked_fill_(
+                attn_mask, float("-inf"))
         for layer in self.layers:
             query = layer(
                 query, query_pos, feats, reference_points,
                 world2img, spatial_shapes, image_hw,
                 temp_memory=temp_memory, temp_pos=temp_pos,
                 attn_mask=attn_mask,
+                camera_valid=camera_valid,
+                msda=msda,
             )
             intermediate.append(query)
         return torch.stack(intermediate, dim=0)

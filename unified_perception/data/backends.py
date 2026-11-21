@@ -14,16 +14,18 @@ import cv2
 import math
 import torch
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Protocol, Tuple
-from torchcodec.decoders import VideoDecoder
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Protocol, Tuple
 from torchvision.transforms import v2
 import numpy as np
 
 from ..config import Config
-from ..constants import JOINT_INDEX, NUM_JOINTS
+from ..constants import JOINT_INDEX, NUM_JOINTS, ROOT_JOINTS
 from .interface import DataProvider, SampleRef
 from .registry import register_provider
-from .transforms import normalize_image, resize_image_and_intrinsics
+from .transforms import resize_image_and_intrinsics
+
+if TYPE_CHECKING:
+    from torchcodec.decoders import VideoDecoder  # type: ignore[reportPrivateImportUsage]
 
 
 class DatasetConfigProtocol(Protocol):
@@ -57,6 +59,8 @@ def _window_starts(num_frames: int, seq_len: int, stride: int) -> List[int]:
 
 
 def _split_sequences(seq_ids: List[str], split: str, val_fraction: float, seed: int) -> List[str]:
+    if split not in ("train", "val"):
+        raise ValueError("Raw provider supports train/val only; use an explicit composition manifest for test")
     seq_ids = sorted(seq_ids)
     rng = random.Random(seed)
     rng.shuffle(seq_ids)
@@ -75,6 +79,7 @@ class HumanPriorSequence:
     source_id: str
     num_frames: int
     stride: int
+    mocap_indices: Optional[List[int]] = None
 
 
 @register_provider("human_prior_aligned")
@@ -134,10 +139,13 @@ class HumanPriorAlignedProvider(DataProvider):
                     frames = json.load(f)
                 traceability_path = os.path.join(seq_dir, "traceability.json")
                 stride = 1
+                indices = None
                 if os.path.exists(traceability_path):
                     with open(traceability_path, "r") as f:
                         traceability = json.load(f)
                     indices = traceability.get("source_mocap_indices", [])
+                    if len(indices) != len(frames) or any(b <= a for a, b in zip(indices, indices[1:])):
+                        raise ValueError(f"Invalid source frame traceability in {seq_dir}")
                     if len(indices) >= 2:
                         stride = int(indices[1]) - int(indices[0])
                 source, source_id = _parse_human_prior_source_id(name)
@@ -149,6 +157,7 @@ class HumanPriorAlignedProvider(DataProvider):
                     source_id=source_id,
                     num_frames=len(frames),
                     stride=stride,
+                    mocap_indices=indices,
                 )
         if not seqs:
             raise RuntimeError(
@@ -264,9 +273,10 @@ class HumanPriorAlignedProvider(DataProvider):
         seq = self._seqs[seq_id]
         seq_name = seq_id.split("/", 1)[-1]
         segment_start = _segment_start_from_seq_name(seq_name)
-        requested_source_mocap = [
-            segment_start + (f + start) * seq.stride for f in range(self.seq_len)
-        ]
+        requested_source_mocap = (
+            seq.mocap_indices[start:start + self.seq_len] if seq.mocap_indices is not None
+            else [segment_start + (f + start) * seq.stride for f in range(self.seq_len)]
+        )
         # Map source mocap index → 0-based video frame index.
         # fps_ratio = mocap_fps / camera_fps (integer, ≥1 for all current datasets).
         # Floor division avoids banker's-rounding artefacts: for MOYO (ratio=2) both
@@ -275,8 +285,7 @@ class HumanPriorAlignedProvider(DataProvider):
         # cam_offset = first_frame_index - 1: the 0-based start offset of the video
         # within the original image-file sequence (non-zero for MOYO).
         fps_ratio = max(1, ds_cfg.mocap_fps // ds_cfg.camera_fps)
-        # TODO: Debug why we are sometimes getting negative indices when this is used. For now, disable it.
-        cam_offset = 0 #  ds_cfg.get_camera_image_offset(cam_id)
+        cam_offset = ds_cfg.get_camera_image_offset(cam_id)
         return [int(i // fps_ratio - cam_offset) for i in requested_source_mocap]
 
     def _load_window_images(
@@ -292,6 +301,8 @@ class HumanPriorAlignedProvider(DataProvider):
         and the corresponding image map.  Raises ValueError if fewer than num_cameras
         valid cameras are available.
         """
+        from torchcodec.decoders import VideoDecoder  # type: ignore[reportPrivateImportUsage]
+
         image_map: Dict[str, List[torch.Tensor]] = {}
         skipped: List[Tuple[str, str]] = []
 
@@ -316,7 +327,7 @@ class HumanPriorAlignedProvider(DataProvider):
         used_cam_ids = list(image_map.keys())
         return used_cam_ids, image_map
 
-    def load_window(self, sample: SampleRef) -> dict:
+    def load_window(self, sample: SampleRef, camera_ids: Optional[List[str]] = None) -> dict:
         seq_id, start = sample
         seq = self._seqs[seq_id]
         ds_cfg = self._dataset_cfg_for_seq(seq)
@@ -331,10 +342,15 @@ class HumanPriorAlignedProvider(DataProvider):
 
         # Shuffle all cameras so the camera-level fallback (for truncated videos)
         # picks different cameras each call rather than always trying in sorted order.
-        all_cam_ids = list(cam_defs.keys())
-        np.random.shuffle(all_cam_ids)
+        all_cam_ids = list(cam_defs.keys()) if camera_ids is None else list(camera_ids)
+        if camera_ids is None:
+            np.random.shuffle(all_cam_ids)
+        wanted = (min(self.num_cameras, len(cam_defs))
+                  if self.cfg.data.allow_fewer_cameras else self.num_cameras)
+        if camera_ids is not None and (len(all_cam_ids) != wanted or len(set(all_cam_ids)) != len(all_cam_ids) or any(c not in cam_defs for c in all_cam_ids)):
+            raise ValueError(f"Invalid fixed camera set for {seq_id}: {all_cam_ids}")
         cam_ids, images_rgb = self._load_window_images(
-            ds_cfg, sample, all_cam_ids, self.num_cameras
+            ds_cfg, sample, all_cam_ids, wanted
         )
 
         keypoints = np.zeros((len(frames), self.max_people, NUM_JOINTS, 3), dtype=np.float32)
@@ -359,10 +375,10 @@ class HumanPriorAlignedProvider(DataProvider):
         def _prepare_img(frame_idx: int, cam_idx: int, K: np.ndarray) -> Tuple[torch.Tensor, np.ndarray]:
             rgb = images_rgb[cam_ids[cam_idx]][frame_idx]
             rgb, K2 = resize_image_and_intrinsics(rgb, K, self.out_hw)
-            img = normalize_image(rgb, self.mean, self.std)
+            img = rgb.permute(2, 0, 1).contiguous()
             return img, K2
 
-        return _build_output_window(
+        output = _build_output_window(
             seq=seq_id,
             start=start,
             seq_len=self.seq_len,
@@ -376,9 +392,16 @@ class HumanPriorAlignedProvider(DataProvider):
             T_by_cam=T_by_cam,
             image_loader=_prepare_img,
         )
+        output["camera_ids"] = cam_ids
+        output["frame_ids"] = np.asarray(
+            self._desired_frame_indices(ds_cfg, sample, cam_ids[0]), dtype=np.int64
+        )
+        return output
 
 
     def _get_video_decoder(self, ds_cfg: DatasetConfigProtocol, cam_id: str) -> Tuple[VideoDecoder, Tuple[int, int]]:
+        from torchcodec.decoders import VideoDecoder  # type: ignore[reportPrivateImportUsage]
+
         cap = cv2.VideoCapture(_video_path_for_camera(ds_cfg, cam_id))
         assert cap.isOpened()
         height, width = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -779,16 +802,25 @@ def _build_output_window(
     R_by_cam: np.ndarray,
     T_by_cam: np.ndarray,
     image_loader: Callable[[int, int, np.ndarray], Tuple[torch.Tensor, np.ndarray]],
+    keypoint_frame_valid: Optional[np.ndarray] = None,
+    gt_root: Optional[np.ndarray] = None,
+    gt_root_valid: Optional[np.ndarray] = None,
+    gt_keypoint_valid: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     T = seq_len
     N = num_cameras
     J = keypoints.shape[2]
 
-    imgs = torch.zeros((T, N, 3, out_hw[0], out_hw[1]), dtype=torch.float32)
+    imgs = torch.zeros((T, N, 3, out_hw[0], out_hw[1]), dtype=torch.uint8)
     world2img = np.zeros((T, N, 4, 4), dtype=np.float32)
     intrinsics = np.zeros((T, N, 4, 4), dtype=np.float32)
     gt_kpts = np.zeros((T, max_people, J, 3), dtype=np.float32)
     gt_valid = np.zeros((T, max_people), dtype=bool)
+    gt_kpt_valid = np.zeros((T, max_people, J), dtype=bool)
+    roots = np.zeros((T, max_people, 3), dtype=np.float32)
+    roots_valid_out = np.zeros((T, max_people), dtype=bool)
+    frame_valid_out = (np.ones(T, dtype=bool) if keypoint_frame_valid is None
+                       else np.asarray(keypoint_frame_valid, dtype=bool)[:T].copy())
 
     for ti in range(T):
         for c in range(N):
@@ -807,6 +839,18 @@ def _build_output_window(
         for pi, pj in enumerate(people):
             gt_kpts[ti, pi] = keypoints[ti, pj]
             gt_valid[ti, pi] = True
+            if gt_keypoint_valid is not None:
+                gt_kpt_valid[ti, pi] = np.asarray(gt_keypoint_valid[ti, pj], dtype=bool)
+            else:
+                gt_kpt_valid[ti, pi] = True
+            gt_kpt_valid[ti, pi] &= frame_valid_out[ti]
+            if gt_root is not None:
+                roots[ti, pi] = np.asarray(gt_root[ti, pj], dtype=np.float32)
+            else:
+                roots[ti, pi] = gt_kpts[ti, pi, list(ROOT_JOINTS)].mean(axis=0)
+            roots_valid_out[ti, pi] = (
+                bool(gt_root_valid[ti, pj]) if gt_root_valid is not None else True
+            )
 
     return {
         "imgs": imgs,
@@ -814,6 +858,10 @@ def _build_output_window(
         "intrinsics": intrinsics,
         "gt_keypoints": gt_kpts,
         "gt_valid": gt_valid,
+        "gt_keypoint_frame_valid": frame_valid_out,
+        "gt_keypoint_valid": gt_kpt_valid,
+        "gt_root": roots,
+        "gt_root_valid": roots_valid_out,
         "seq": seq,
         "start": start,
     }

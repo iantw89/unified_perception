@@ -419,7 +419,7 @@ def run_profile(args: argparse.Namespace) -> None:
 
     # ── Build model, criterion, optimizer ──────────────────────────────────
     model     = UnifiedPerceptionModel(cfg).to(device).train()
-    criterion = SetCriterion(cfg.model)
+    criterion = SetCriterion(cfg.model, cfg.loss)
     if args.compile:
         torch._dynamo.config.capture_scalar_outputs = True
         print("[profiler] torch.compile(model)  (warmup steps absorb first-run compile time)...")

@@ -1,0 +1,132 @@
+# Full-size run (pipe_cleaner_rangefix scale) with the v4-calibration gym pseudo-GT.
+# Agreed with the user:
+# - 640 px, 4 cameras, torch.compile (as rangefix); batch 8 (16 at seq 8 spills past 24 GB),
+#   lr 2.8e-4 (sqrt-scaled from rangefix's 4e-4 @ batch 16)
+# - temporal window as the gym runs: seq 8, stride 2, memory 8/8/64
+# - gym volume: y +/-12.5 m (v4 targets reach +12.05 m), depth 0.5-24 m with 128 LID bins
+# - mocap: composition cache rebuilt at 640/4cam/seq8 (H36M+MPI, multi-person)
+#   plus MOYO as single-person originals (composition excludes MOYO by design)
+# - mixture: 35% composition, 50% gym (all 4 views), 15% MOYO
+# - 100k optimizer steps; last.pt every 500 steps (atomic). Kill any time; restart
+#   with the same command (it passes --resume, which starts fresh if last.pt is absent).
+# Validation each epoch: composition val ("val/*"), gym tail 240..300 ("val_gym/*"),
+# 512 held-out MOYO windows ("val_aligned/*").
+data:
+  provider: gym_mocap_mix
+  image_height: 640
+  image_width: 640
+  num_cameras: 4
+  seq_len: 8
+  batch_size: 8
+  num_workers: 8
+  # Smallest exact value is 15 (largest 8-frame, 4-view gym window); composition holds <= 8.
+  max_people: 16
+  stride: 2
+  max_samples_per_epoch: 0
+  gpu_decode: false
+  val_fraction: 0.2
+  split_seed: 0
+  pixel_mean:
+  - 0.0
+  - 0.0
+  - 0.0
+  pixel_std:
+  - 255.0
+  - 255.0
+  - 255.0
+  aug_flip_views: false
+  human_prior_repo: ../human_prior
+  human_prior_aligned_dirs:
+  - G:\My Drive\FitnessData\test_output_h36m
+  - G:\My Drive\FitnessData\test_output_mpi3dhp
+  human_prior_target_fps: 10.0
+  human_prior_h36m_dataset_path: G:\My Drive\FitnessData\Human3.6
+  human_prior_moyo_dataset_path: G:\My Drive\FitnessData\MoYo
+  human_prior_mpi_dataset_path: G:\My Drive\FitnessData\mpi_inf_3dhp
+  use_shuffle_buffer: false
+  buffer_frames: 2048
+  min_buffer_seg: 4
+  prefetch_queue_depth: 0
+  composition_manifest: data/composition_640_c4_s8/cache/experiment.json
+  composition_original_fraction: 0.25
+  composition_datasets:
+  - h36m
+  - mpi
+  composition_mpi_masks: background
+  gym_pseudo3d_root: data_cache\gym_pseudo3d_20250505_v4_640
+  gym_sample_fraction: 0.5
+  gym_mix_aligned_dirs:
+  - G:\My Drive\FitnessData\test_output_moyo
+  gym_mix_aligned_fraction: 0.15
+model:
+  embed_dims: 256
+  position_range:
+  - -6000.0
+  - -12500.0
+  - -200.0
+  - 6000.0
+  - 12500.0
+  - 3000.0
+  num_joints: 12
+  backbone_type: yolo_pose
+  yolo_model_name: yolo11n-pose.pt
+  yolo_feature_indices:
+  - 16
+  - 19
+  - 22
+  yolo_trainable: false
+  yolo_force_download: true
+  depth_num: 128
+  depth_start_mm: 500.0
+  depth_max_mm: 24000.0
+  lid_depth: true
+  num_queries: 64
+  dec_layers: 6
+  dec_heads: 8
+  dec_ffn_dim: 2048
+  dec_num_pts: 13
+  dec_groups: 8
+  dropout: 0.1
+  num_propagated: 8
+  memory_topk: 8
+  memory_len: 64
+  with_dn: true
+  dn_scalar: 10
+  dn_noise_scale: 0.2
+  dn_split: 0.75
+  dn_weight: 1.0
+  use_mmcv_msda: true
+  cost_class: 2.0
+  cost_kpt: 5.0
+  loss_class: 2.0
+  loss_kpt: 5.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+loss:
+  # Rough hip-centre roots supervise present people even when no joint is triangulated.
+  root_weight: 5.0
+train:
+  output_dir: runs/gym_pseudo3d_full_v4
+  max_epochs: 100000
+  max_steps: 100000
+  lr: 0.00028
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  warmup_iters: 200
+  log_interval: 10
+  ckpt_interval: 1
+  ckpt_every_steps: 500
+  cuda_memory_fraction: 0.9
+  eval_interval: 1
+  viz_batch_interval: 5000
+  device: cuda
+  seed: 0
+  resume: null
+  compile_model: true
+eval:
+  pck_thresholds_mm:
+  - 50.0
+  - 100.0
+  - 150.0
+  max_eval_batches: 0
+  match_threshold_mm: 600.0

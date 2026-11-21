@@ -1,0 +1,46 @@
+# Full H36M/MPI experiment; the runner supplies manifests and per-arm budgets.
+data:
+  provider: human_prior_aligned
+  human_prior_repo: ../human_prior
+  human_prior_aligned_dirs:
+    - "G:\\My Drive\\FitnessData\\test_output_h36m"
+    - "G:\\My Drive\\FitnessData\\test_output_mpi3dhp"
+  human_prior_h36m_dataset_path: "G:\\My Drive\\FitnessData\\Human3.6"
+  human_prior_mpi_dataset_path: "G:\\My Drive\\FitnessData\\mpi_inf_3dhp"
+  image_height: 320
+  image_width: 320
+  num_cameras: 3
+  seq_len: 8
+  batch_size: 8
+  num_workers: 2
+  max_people: 8
+  use_shuffle_buffer: false
+model:
+  embed_dims: 256
+  backbone_type: yolo_pose
+  yolo_model_name: yolo11n-pose.pt
+  yolo_trainable: false
+  num_queries: 64
+  num_propagated: 8
+  memory_topk: 8
+  memory_len: 64
+  dec_layers: 6
+  dec_heads: 8
+  dec_ffn_dim: 2048
+  dec_num_pts: 13
+  dec_groups: 8
+  with_dn: true
+train:
+  max_epochs: 10000
+  lr: 0.0002
+  warmup_iters: 200
+  grad_clip: 1.0
+  log_interval: 20
+  ckpt_interval: 1
+  eval_interval: 1
+  compile_model: false
+  device: cuda
+  seed: 0
+eval:
+  pck_thresholds_mm: [50.0, 100.0, 150.0]
+  match_threshold_mm: 600.0

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 
 import torch
@@ -38,7 +39,7 @@ def main():
         num_workers=cfg.data.num_workers, collate_fn=collate_batch,
     )
     metrics = run_eval(model, loader, cfg, device, score_threshold=args.score_threshold)
-    print(json.dumps(metrics, indent=2))
+    print(json.dumps({k: v if math.isfinite(v) else None for k, v in metrics.items()}, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,121 @@
+# Based on the latest completed composition_experiment augmented/config.yaml (30k updates).
+# Mocap: the baseline's local composition manifest (multi-person, original fraction 0.25).
+# Gym: 3 of its 4 reviewed views per sample (0,1,2,6); people unseen by the chosen
+# views are non-existent. z-up/mm, train-fitted xy offset.
+# Wider volume/depth are EXPLICIT: translation cannot fit a 23m gym into 12m.
+# Validation: mocap composition val ("val/*") and gym tail 240..300 ("val_gym/*") each eval.
+data:
+  provider: gym_mocap_mix
+  image_height: 320
+  image_width: 320
+  num_cameras: 3
+  # Baseline window length; every gym window contains >=1 labeled frame.
+  seq_len: 8
+  batch_size: 8
+  num_workers: 2
+  # Smallest exact value: some 8-frame gym windows show 14 people in a 3-view subset
+  # (after dropping people outside the undistortion crop). The provider raises if too small.
+  max_people: 14
+  stride: 2
+  max_samples_per_epoch: 0
+  gpu_decode: false
+  val_fraction: 0.2
+  split_seed: 0
+  pixel_mean:
+  - 0.0
+  - 0.0
+  - 0.0
+  pixel_std:
+  - 255.0
+  - 255.0
+  - 255.0
+  aug_flip_views: false
+  human_prior_repo: ../human_prior
+  human_prior_aligned_dirs:
+  - G:\My Drive\FitnessData\test_output_h36m
+  - G:\My Drive\FitnessData\test_output_mpi3dhp
+  human_prior_target_fps: 10.0
+  human_prior_h36m_dataset_path: G:\My Drive\FitnessData\Human3.6
+  human_prior_moyo_dataset_path: null
+  human_prior_mpi_dataset_path: G:\My Drive\FitnessData\mpi_inf_3dhp
+  use_shuffle_buffer: false
+  buffer_frames: 2048
+  min_buffer_seg: 4
+  prefetch_queue_depth: 0
+  composition_manifest: C:\Users\iantw\git\unified_perception\runs\composition_experiment\cache\experiment.json
+  composition_original_fraction: 0.25
+  composition_datasets:
+  - h36m
+  - mpi
+  gym_pseudo3d_root: data_cache\gym_pseudo3d_20250505
+  gym_sample_fraction: 0.25
+model:
+  embed_dims: 256
+  position_range:
+  - -6000.0
+  - -12000.0
+  - -200.0
+  - 6000.0
+  - 12000.0
+  - 3000.0
+  num_joints: 12
+  backbone_type: yolo_pose
+  yolo_model_name: yolo11n-pose.pt
+  yolo_feature_indices:
+  - 16
+  - 19
+  - 22
+  yolo_trainable: false
+  yolo_force_download: true
+  depth_num: 64
+  depth_start_mm: 500.0
+  depth_max_mm: 24000.0
+  lid_depth: true
+  num_queries: 64
+  dec_layers: 6
+  dec_heads: 8
+  dec_ffn_dim: 2048
+  dec_num_pts: 13
+  dec_groups: 8
+  dropout: 0.1
+  num_propagated: 8
+  memory_topk: 8
+  memory_len: 64
+  with_dn: true
+  dn_scalar: 10
+  dn_noise_scale: 0.2
+  dn_split: 0.75
+  dn_weight: 1.0
+  use_mmcv_msda: true
+  cost_class: 2.0
+  cost_kpt: 5.0
+  loss_class: 2.0
+  loss_kpt: 5.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+loss:
+  # Rough hip-centre roots supervise present people even when no joint is triangulated.
+  root_weight: 5.0
+train:
+  output_dir: runs/gym_pseudo3d_mix
+  max_epochs: 10000
+  max_steps: 30000
+  lr: 0.0002
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  warmup_iters: 200
+  log_interval: 20
+  ckpt_interval: 1
+  eval_interval: 1
+  viz_batch_interval: 0
+  device: cuda
+  seed: 0
+  resume: null
+  compile_model: false
+eval:
+  pck_thresholds_mm:
+  - 50.0
+  - 100.0
+  - 150.0
+  max_eval_batches: 0
+  match_threshold_mm: 600.0

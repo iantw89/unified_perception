@@ -105,13 +105,358 @@ data:
 This backend reads `mocap_keypoints.json` and `alignment_results.json`, then
 uses human_prior dataset adapters to stream calibrated camera frames.
 
+### Sparse 3D supervision
+
+Samples may optionally include `gt_keypoint_frame_valid` (`T`, bool),
+`gt_keypoint_valid` (`T,P,J`, bool), `gt_root` (`T,P,3`, mm), and
+`gt_root_valid` (`T,P`, bool). Missing masks preserve dense-data behavior:
+all joints of each existing person are valid, with the frame mask AND-ed in;
+roots are derived from the mean of the left/right hips for valid people.
+`gt_valid` remains the per-frame person-existence/count target. Sparse frames
+match on class plus predicted-vs-target hip-root cost; valid-joint targets on
+supervised frames retain keypoint matching, while persons with no valid joints
+fall back to root matching. Classification and root loss use all available
+frames; keypoint L1, MPJPE, and PCK use only valid joints.
+
+For sparse runs, configure `loss.root_weight: 5.0` (default `0.0` preserves old
+losses) and optionally `model.cost_root: 5.0` (default), while keeping
+`model.cost_root_labeled: 0.0` unless a small labeled-frame root tie-breaker is
+desired. DN queries are skipped on unlabeled frames and for people without
+both hips annotated because their noise anchors use the bilateral-hip mean. The
+main matched-query root loss still supervises valid roots in either case.
+
+### Multi-person cutout augmentation
+
+The opt-in composition workflow uses label-gated background subtraction and **native
+positions**, not arbitrary 3D relocation. It requires matching camera/image
+geometry, verified shared world coordinates, and disjoint temporal body proxies.
+Sparse joints do not provide surface depth: overlapping masks are accepted only
+when conservative whole-body camera-depth intervals establish an unambiguous
+order. Otherwise the candidate is rejected. This trades generation yield for
+correctness and is not a physically accurate renderer.
+
+All inserted people remain ground-truth targets, **including completely hidden
+people**. Visibility never filters labels or weights losses. Different clips of
+one actor may be used together, with distinct synthetic instance IDs.
+
+Augmentation uses **H36M and MPI-INF-3DHP only**. MOYO is excluded from its source
+clips, background templates, and manifests; its original data is still available
+through the normal provider. `data.composition_datasets` defaults to
+`["h36m", "mpi"]` and can select a subset of these two sources.
+
+Run tools from the repository root with the selected Python environment:
+
+```powershell
+python -m unified_perception.tools.compose audit --config configs\small.yaml --output runs\composition\audit.json
+```
+
+The audit lists actual cameras, effective FPS, source IDs, and calibration
+fingerprints. Fingerprint equality is only a compatibility candidate, not
+verification of a shared world or scene. Existing provider warnings about missing
+or truncated videos must be resolved or the affected sources excluded.
+
+Create a source specification JSON. Assign source splits **before windowing**,
+following the dataset's subject/sequence protocol; do not use random window
+splits. All segments of an original recording must stay together. An example
+entry (repeat for compatible windows in each split) is:
+
+```json
+{
+  "split_protocol": "Document the dataset-specific subject/recording assignments here.",
+  "clips": [
+    {
+      "id": "h36m-train-001",
+      "sequence": "test_output_h36m/subj_11_act_2_sub_1",
+      "subject": "h36m:11",
+      "split": "train",
+      "split_group": "h36m:11",
+      "capture_group": "verified-rig-and-world-identifier",
+      "geometry_verified": true,
+      "start": 0,
+      "camera_ids": ["0", "1", "2", "3"]
+    }
+  ]
+}
+```
+
+The sequence/camera IDs above are illustrative: use the audit's actual values.
+Only mark geometry verified after checking calibration, world units/offsets,
+timing, and projected joints. `split_group` is the protocol's isolation unit
+(e.g. a subject). Preparation also derives a canonical source-recording key to
+prevent separate alignment segments of one recording crossing splits.
+
+Background estimation averages each pixel only in frames where the projected
+person, with an inferred head and a conservative 200 mm margin, is away from
+that pixel. Templates are built separately per capture group, camera, and split.
+They retain mean, standard deviation, and the number of clean observations.
+Overlapping source windows do not count the same camera frame repeatedly.
+No model weights, new dependencies, or external services are required.
+Set `FFMPEG_SHARED_BIN` and expose its shared DLLs on Windows when decoding
+original videos, as for normal training.
+Cached composition does not require TorchCodec/FFmpeg video decoding.
+
+```powershell
+python -m unified_perception.tools.compose prepare --config configs\small.yaml --spec runs\composition\sources.json --output runs\composition\cache
+python -m unified_perception.tools.compose preview --manifest runs\composition\cache\catalog.json --output runs\composition\source_review
+```
+
+Preparation selects fixed cameras, rectifies distortion, checks complete 3D
+annotations and projected mask coverage, and caches uint8 RGB, bool masks,
+calibration, joints, frame indices, and hashes. Strong differences use a minimum
+20 RGB-level threshold or 3 times background standard deviation, whichever is
+larger. Near projected bones, a weaker 6-level/noise-significant difference may
+recover low-contrast limbs, but only if connected to strong foreground evidence.
+Geometry alone never fills a limb. Brightness-only, color-preserving darkening
+is suppressed near the feet, outside narrow body/shoe protection regions; very dark shoes are
+not treated as ordinary shadows. Morphological gap filling requires weak image
+evidence near bones and cannot reintroduce suppressed floor shadows.
+
+This remains approximate: dark clothing and contact shadows can be ambiguous,
+and nearly identical body/background pixels can remain missing. Review calf
+completeness and shoe edges across frames, not just projected-joint coverage.
+Extraction version `label-gated-mean-v2` invalidates older mask hashes; regenerate
+and review caches rather than reusing approvals from v1.
+
+Differences are constrained to the projected body region to exclude distant
+activity. Every pixel near a target needs at least 3 clean observations;
+otherwise extraction rejects the source rather than treating an unknown
+background as black or averaging a stationary person into it.
+Use `--background-margin-mm`, `--min-background-count`, `--pixel-threshold`, and
+`--noise-scale` to freeze pilot-validated settings. Persistent occupancy or
+similar clothing/background colors can still prevent reliable masks. Provide
+diverse source positions/poses and review the resulting silhouettes.
+Extraction failures are errors, not substituted examples. Use a
+fresh cache directory for each extraction version. Caching decoded source windows
+costs storage and may duplicate overlapping source frames, but avoids storing
+every complete composite.
+
+At visible person-to-person occlusion borders, the compositor mixes visible RGB
+pixels in a 3x3 neighborhood with random positive weights. Only borders between
+overlapping masks are eligible: scene-background edges, body interiors, hidden
+people, masks, visibility fractions, and 3D labels are unchanged. Weights vary
+across pixels/frames but are deterministically seeded from source provenance, so
+preview, evaluation, and training reproduce the same image. This reduces hard
+halo seams; it does not guarantee artifact-free images or shortcut-free learning.
+Inspect both edge softness and temporal flicker. Composition manifest version 2
+requires regenerated recipes and fresh visual approval; source RGB/mask caches
+can be reused. `compose(..., blend_intersections=False)` provides an unblended
+diagnostic comparison, not the training default.
+
+Review synchronized preview videos for segmentation edges, missing body parts,
+source occluders, shadows, temporal flicker, calibration, and background/lighting
+compatibility. Save a review JSON with `reviewer`, `rubric`, `approved` (IDs), and
+`rejected` (IDs). By default, unreviewed entries are not approved. At least 95%
+of reviewed examples must pass; failed examples are excluded. After a
+representative pilot passes, an explicit `"approve_remaining": true` decision
+can approve the remaining automatically validated records. This requires review
+coverage of every capture-group/person-count stratum, and records the reviewer
+and rollout decision rather than pretending every example was manually viewed.
+
+```json
+{
+  "reviewer": "reviewer-name",
+  "rubric": "Checked every camera/frame for complete foreground and temporal/calibration consistency.",
+  "approved": ["h36m-train-001"],
+  "rejected": []
+}
+```
+
+```powershell
+python -m unified_perception.tools.compose review --manifest runs\composition\cache\catalog.json --review runs\composition\source_decisions.json
+python -m unified_perception.tools.compose generate --config configs\small.yaml --catalog runs\composition\cache\catalog.json --output runs\composition\cache\pilot.json --train-count 20 --val-count 10 --test-count 10 --people 2
+python -m unified_perception.tools.compose preview --manifest runs\composition\cache\pilot.json --output runs\composition\pilot_review --limit 40
+python -m unified_perception.tools.compose review --manifest runs\composition\cache\pilot.json --review runs\composition\pilot_decisions.json
+```
+
+The pilot commands require approved sources in **all requested splits**; the
+single-entry example is not sufficient. Review generated recipes as well as
+source masks before loading them for training/evaluation. Increase preview
+`--limit` or use `--ids` to inspect the intended review sample, including every
+count/capture group. The review log identifies exactly which IDs were accepted.
+
+Generation samples counts round-robin for balanced coverage, canonicalizes donor
+permutations, and stops after `--max-attempts`. A rejection report records achieved
+counts and failure reasons. It does not publish a usable manifest if the
+requested counts cannot be reached. Default conservative body radius and depth
+margin are 150 mm; freeze validated values for benchmarks. Swept body bounding
+volumes include torso/limb and inferred-head proxies and can over-reject.
+
+Keep manifests beside their caches. Manifests freeze source hashes, parameters,
+seeds, source roles, camera ordering, and split provenance. Changed caches,
+capacity overflow, split leakage, unreviewed pilots, and stale ordering fail
+explicitly. Files must remain immutable while a loader is using them.
+
+After the two-person pilot passes, request `--people 2 3 4 5 6 7 8` and target
+10 times as many distinct training recipes as eligible original windows, **only
+where source geometry permits**. Generated combinations are not independent new
+identities. A frozen recipe bank is shuffled by the training loader; no video
+seeking/segmentation occurs during training. Recipes are not resampled online.
+
+```powershell
+python -m unified_perception.tools.train --config configs\small.yaml data.composition_manifest=runs\composition\cache\pilot.json data.max_people=8 train.max_steps=3000 train.max_epochs=100 train.output_dir=runs\composed
+python -m unified_perception.tools.evaluate --config configs\small.yaml --checkpoint runs\composed\best.pt --split test data.composition_manifest=runs\composition\cache\pilot.json data.max_people=8
+```
+
+`data.composition_original_fraction` defaults to 0.25: approximately 25% original
+cached clips and 75% recipes in training (rounded to whole windows). Evaluation
+uses only the split's approved composites. Set it to `1.0` for original-only
+training/evaluation on exactly the same source pool; set it to `0.0` for
+composite-only training. Disable `data.composition_manifest` to retain the normal
+provider/shuffle-buffer path. Composition never uses the shuffle buffer or the
+normal dataset's sample-substitution retry logic.
+
+Compare the existing baseline, original-only extended training, and augmented
+extended training. Set both extended runs to **3 times the baseline successful
+optimizer updates**, with the same effective batch size/settings; `3000` above
+is an example, not a prescribed budget. `max_epochs` must be large enough to
+reach `max_steps`, otherwise training raises an incomplete-budget error.
+Step-budgeted resumes require checkpoints with saved optimizer-step counters.
+
+#### Official MPI masks and preparation-only expansion
+
+MPI preparation can use the dataset's `FGmasks` and `ChairMasks` videos instead
+of estimating silhouettes from RGB background differences. The defaults remain
+unchanged. Set `data.composition_mpi_masks` in the config used by `tools.compose
+prepare`, or use `--mpi-masks` with the experiment runner:
+
+- `background`: the existing label-gated extractor (also used for H36M).
+- `prefer`: use official masks when available; missing assets or the dataset's
+  known-bad background masks (S1/Seq2 and S4/Seq2) produce a warning and a recorded
+  fallback reason, then use background extraction.
+- `required`: reject those sources rather than fall back. Corrupt videos,
+  missing frames, shape/FPS mismatches and failed projected-joint coverage
+  checks reject sources in either official-mask mode.
+
+The official red channels are **keep-masks**: FG red retains non-greenscreen;
+chair red retains non-chair (the chair itself is black). Clothing channels are
+not person silhouettes. Extraction combines both red channels, constrains the
+result to the projected body footprint, and removes tiny disconnected artifacts.
+It reads the same zero-based, per-camera source-video indices as RGB, including
+segment offsets; applies the identical aspect-preserving resize/padding and
+camera undistortion; and records asset hashes and extraction provenance.
+This improves silhouettes but is not a guarantee of perfect hands, shoes or
+person/chair boundaries. Visual review is still required.
+
+After reading and accepting MPI's dataset license, fetch masks only (not RGB or
+annotations). This can download several GB; the default covers all subjects and
+both recordings. Use `--subjects 8 --sequences 1` for a smaller pilot:
+
+```powershell
+python -m unified_perception.tools.download_mpi_masks --root "G:\My Drive\FitnessData\mpi_inf_3dhp" --accept-dataset-license
+```
+
+The downloader checks ZIP integrity during extraction, installs only camera
+AVIs, refuses to overwrite different files, and records hashes in per-archive
+receipts. Repeat invocations verify and reuse installed assets. Additional
+camera archives can be selected with `--archives vnect_cameras
+other_angled_cameras ceiling_cameras`.
+
+To stage more data **without starting any training or evaluation**, use a fresh
+output directory:
+
+```powershell
+$env:FFMPEG_SHARED_BIN = 'C:\path\to\shared-ffmpeg\bin'
+python -m unified_perception.tools.composition_experiment --config configs\composition_experiment.yaml --output runs\composition_next --prepare-only --mpi-masks prefer --mpi-windows-per-sequence 96 --mpi-camera-sets 0,2,4 1,5,6 --mpi-cross-segment
+```
+
+`--mpi-windows-per-sequence` increases MPI's window budget independently of
+H36M. Camera sets each have the configured number of views, so model input
+shape stays unchanged; they create separate cache IDs and composition pools.
+Missing camera coverage is explicitly excluded, never silently substituted.
+`--mpi-cross-segment` pools official-mask clips from the same subject/recording
+only when camera ordering, FPS, intrinsics and projections match exactly.
+Different alignment corrections keep segments separate. Background-extracted
+clips remain isolated by segment. Existing collision and per-camera depth
+checks still apply; bigger requested pools do not guarantee bigger crowds.
+
+The preparation-only command stops after writing the source catalog; it never
+generates recipes, launches training, or evaluates a checkpoint. It reports
+`stage: prepared` and `training_started: false`. Inputs, mask assets, budgets
+and camera sets are checked before cache reuse. The completed experiment's
+directories/specification must not be rewritten to accommodate this change;
+use new outputs when adding features or changing assets. H36M masks are not
+improved by the MPI-only path.
+
+Evaluation adds person-count/camera/capture buckets, visibility recall, count
+MAE, missed-person coverage, and query-slot ID switches/fragments/coverage.
+Associations use geometric matching, reset at every window, and count a query
+change after a gap as a switch. Fragments count matched runs, including the first.
+These are query-index diagnostics, not trained identity tracking. No new loss or
+post-hoc tracker is introduced. Pose metrics with no matches are undefined
+(`NaN` internally, JSON `null`), never a perfect zero error.
+
+The auxiliary-layer loss audit corrected double division by decoder depth;
+regenerate comparison baselines with the same corrected loss. Both normal
+map-style and cached loaders now supply raw uint8 RGB; normalization happens
+once in the training/evaluation loop, consistently with the shuffle buffer.
+The related tensor resize path now preserves the image/intrinsic contract.
+
+See [the agreed plan](synthetic_multi_person_plan.txt) for acceptance thresholds.
+Freeze model selection, thresholds, recipes, and metric definitions on validation
+before final test evaluation. Synthetic scores do not establish real-crowd
+generalization without a compatible held-out real multi-person benchmark.
+
+### Full local comparison
+
+The experiment runner uses `configs\composition_experiment.yaml`: 320-pixel
+inputs, 8 frames, 3 cameras, batch size 8, a frozen pretrained YOLO backbone, and
+a 256-dimensional, six-layer, 64-query temporal head. All arms start from the
+same seed with fresh heads; older checkpoints are not used for initialization.
+The default budgets are 10,000 baseline updates and 30,000 augmented updates.
+The augmented arm is snapshotted and evaluated at 10,000 updates for the primary,
+step-matched comparison, then resumed to 30,000 as a secondary signal (the
+learning rate is constant after warmup, so this matches an uninterrupted run).
+There is no longer-trained original-only control; older runs such as
+`runs\pipe_cleaner_cuda` used random sequence splits that include the held-out
+subjects and different input settings, so they are not comparable.
+
+```powershell
+$env:FFMPEG_SHARED_BIN = 'C:\path\to\shared-ffmpeg\bin'
+python -u -m unified_perception.tools.composition_experiment --config configs\composition_experiment.yaml --output runs\composition_experiment
+```
+
+The runner assigns H36M subjects 1/5/6/7/8 to training, 9 to validation, and 11 to
+test; MPI S1-S6 to training, S7 to validation, and S8 to test. Source recordings
+and all their segments stay together. It samples up to 24 windows per aligned
+sequence and builds background estimates within that sequence only. Invalid
+annotations, out-of-volume people, insufficient clean background support, and
+failed masks are explicitly excluded and recorded. MOYO is not used in this
+comparison. Original evaluation uses unchanged RGB from the accepted source
+pool; this does not replace the separate all-original/MOYO benchmark.
+
+It requests approximately 10x recipes spread over counts 2-8, with 512 candidate
+attempts per capture-group/count. Infeasible or underfilled counts are reported
+without silently substituting smaller crowds. Decoded generation caches are
+bounded to one capture group. Expect preparation/generation to precede GPU
+training and to take substantial time.
+
+This runner is for the user's **provisional acceptance of current mask quality**,
+not evidence that the normal 95% visual-review gate has been met. It marks this
+qualification in its manifests and metrics. The usual prepare/review/generate
+workflow above retains its explicit quality gate.
+
+Inspect `status.json`, `experiment-spec.json`, `cache\catalog.json`,
+`cache\generation-progress.json`, each arm's `console.log`, and `results.json`
+inside the output directory. Results include original/synthetic validation and
+test metrics and the agreed baseline acceptance thresholds for both the 10,000-
+and 30,000-update augmented checkpoints. Fixed-step checkpoints (`step-N.pt`)
+are evaluated at the fixed 0.3
+score threshold; test results never select checkpoints or thresholds.
+Undefined pose errors remain JSON `null`, with misses and coverage reported.
+
+Rerun the same command to reuse completed preparation/generation groups and
+resume epoch checkpoints. Configuration and core implementation hashes must
+match; otherwise use a fresh output directory. Checkpoints retain optimizer
+updates; logs append on resume. Resume is epoch-granular, not an exact replay
+of an interrupted batch sequence. Do not run two writers on the same output.
+
 ## Outputs
 
 `MultiViewPoseDataset` yields per-window tensors:
 
 | key | shape | notes |
 |---|---|---|
-| `imgs` | `(T, N, 3, H, W)` | normalised RGB |
+| `imgs` | `(T, N, 3, H, W)` | uint8 RGB; normalised once by the train/eval loop |
 | `world2img` | `(T, N, 4, 4)` | `K4 @ [R\|T]` projection |
 | `intrinsics` | `(T, N, 4, 4)` | padded `K` |
 | `gt_keypoints` | `(T, Pmax, J, 3)` | world mm |
@@ -119,3 +464,539 @@ uses human_prior dataset adapters to stream calibrated camera frames.
 
 The model returns per-decoder-layer `cls_scores (L,B,T,Q,1)` and normalised
 `keypoints (L,B,T,Q,J,3)`; `model.denormalize_keypoints` maps them to world mm.
+
+## Reviewed gym sparse pseudo-3D pool
+
+`gym_pseudo3d` reads the cached real session; `gym_mocap_mix` adds it to the
+baseline H36M/MPI composition-manifest pool without changing legacy providers. No
+training is started by importing the data. Build/rebuild explicitly in PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m unified_perception.tools.import_gym_pseudo3d
+# Existing completed caches are protected; --overwrite is an explicit opt-in.
+.\.venv\Scripts\python.exe -m pytest tests\test_gym_pseudo3d.py -q
+```
+
+Defaults read `C:\cvat_labeling_data\20250505071549\pseudo3d_20261031\pseudo_gt`
+(calibration `v5_mono`, identity `analysis\identity_v5.json`, labels from cameras 0/1/2/6 via
+`pseudo_gt\observations.json`; the original cache was built from `pseudo3d_20261030`)
+and `pilot\normalized\{camera}.mp4` under that session, writing only to
+`data_cache\gym_pseudo3d_20250505` (ignored by Git). Only reviewed cameras
+**0, 1, 2, 6**, in that order, are decoded. The cache holds `index.json` and
+`{train,val}\gym_20250505\{calib.npz,poses.npz,images\fNNN_cNNN.png}`.
+Image names use **split-local** frame and camera-slot indices; `poses.frames`
+retains the original session frames and `calib.camera_ids` the source cameras.
+
+- **Train:** frames 0–239; **gym-val:** 240–300, all at 10 fps. No temporal window
+  crosses the boundary. All 301 presence masks and rough roots are saved.
+- **Images:** OpenCV `getOptimalNewCameraMatrix(alpha=0)` undistortion uses the
+  complete source distortion vector (this calibration actually has **14**, not
+  five, coefficients). The new pinhole K is stored. The normal pool letterbox
+  resize makes 320×320 RGB uint8 inputs (320×240 content, 40-pixel top/bottom
+  bars), without adding undistortion borders. Normalization remains in the loop.
+- **Coordinates:** both pools use **z-up, millimetres**, not y-up. Keep gym floor
+  z=0; subtract `[1032.011233, 1485.493804, 0]` mm, fit to **training roots only**
+  and shared by validation. `world_offset_mm` is recorded in the index/calibration;
+  undo with `X_source = X_cache + offset`. Camera translations become
+  `T_cache = T_source + R @ offset`, preserving `X_cam = R X + T` exactly.
+  No scaling, axis swap, clipping, or per-frame centering is performed.
+- **Bounds:** valid cached roots/joints span approximately
+  `[-5269.6,-11022.9,-168.9]` to `[5308.7,11577.8,1738.0]` mm. Translation alone
+  cannot fit a 23 m gym into the default 12 m capture volume. Only the new configs
+  explicitly set `position_range: [-6000,-12000,-200,6000,12000,3000]` and
+  `depth_max_mm: 24000`; defaults/other experiments are unchanged. The provider
+  rejects incompatible bounds, camera counts, or person truncation.
+- **Targets:** `poses.valid` is source `exists` restricted to people visible in the
+  cached images (see `observed` below), including people with no observed joints. `keypoints` are in exactly `constants.JOINT_NAMES` order (verified from
+  the source names). `keypoint_valid`, `labeled`, `root`, `root_valid`, and
+  `root_source` retain sparse supervision/provenance; invalid coordinates are
+  zeroed, never promoted to labels. Dataset outputs additionally include
+  `gt_keypoint_valid (T,P,12)`, `gt_keypoint_frame_valid (T,)`, `gt_root (T,P,3)`,
+  and `gt_root_valid (T,P)` alongside the usual pose/presence fields. Existing
+  dense data relies on the backward-compatible defaults in dataset/collate.
+
+- **Per-view observation (`poses.observed`, F?P?4, format v2):** a person is
+  observed by a reviewed camera on a labeled frame when a human 2-D track
+  (`gt2d\observations.json`, mapped through `analysis\ba_extrinsics_3d.json`
+  `identity`) exists **and** at least one of its labeled joints undistorts inside
+  the alpha=0 crop. Unlabeled frames copy the nearest labeled frame (ties go to
+  the earlier label, as in pseudo-GT `exists`). The uncropped union must equal
+  `exists` exactly (checked). 386 person-frames whose only tracks lie in the
+  cropped periphery are dropped (`dropped_crop_person_frames`) so counts match
+  the images; `valid == observed.any(-1)`.
+
+`configs\gym_pseudo3d_mix.yaml` derives from the latest completed
+`runs\composition_experiment\augmented\config.yaml` and keeps its mocap path:
+the local composition manifest (`runs\composition_experiment\cache\experiment.json`,
+multi-person, `composition_original_fraction: 0.25`), 3 views, `seq_len: 8`.
+Each gym sample uses **3 of the 4 reviewed views** (all four subsets are
+enumerated). People unseen by every chosen view are non-existent in that sample
+(`gt_valid`, root and joint masks cleared, slots compacted); `visibility`,
+`instance_ids` and `capture_group` are emitted like composition samples.
+Gym train uses every 8-frame window containing a labeled frame (185 windows ?
+4 subsets = 740); gym-val uses windows ending on a labeled frame plus the leading
+window (7 ? 4 = 28). `max_people: 14` is the smallest exact value (raised
+otherwise). `gym_sample_fraction: 0.25` repeats gym windows to 25% of an epoch
+(7,213 composition + 2,404 gym = 9,617 samples).
+
+Training evaluates the mocap composition val as `val/*` and, at every eval,
+the gym tail as `val_gym/*` (stdout, TensorBoard, `metrics.csv` split `val_gym`,
+and `best_val_gym.pt` on the best gym MPJPE). `configs\gym_pseudo3d_eval.yaml` is
+a gym-only equivalent for standalone evaluation. Gym-val is not
+session-disjoint. Golden-cache roots between labels are matching cues only, never targets
+(see `match_root` below).
+
+Range/depth side effects on mocap: keypoints and reference points are
+normalised by `position_range`, so doubling Y halves mocap's normalised Y extent
+(it occupies 0.25?0.75) and halves the effective weight of Y errors in the
+normalised L1/matching costs. `depth_max_mm: 24000` spreads the 64 LID depth bins:
+18 (instead of 31) fall in 2?7 m, with ~282 mm spacing at 4 m (was ~162 mm).
+Composition placement is unchanged (manifest ranges; the model range must only
+contain the manifest's).
+
+The converter renders `debug_train_frame010.jpg` and `debug_val_frame250.jpg` at
+the cache root (valid joints/bones, rough-root crosses and person IDs). About
+90?93% of observed (view, person) roots project within a 40-pixel margin of the
+content region; the rest are partially visible people at image edges. Root
+placement and calibration are approximate; do not interpret root-only people as
+dense pose labels. The gym PNG provider/converter do not use torchcodec.
+
+### Full-size v4 run (killable / resumable)
+
+`configs\gym_pseudo3d_full_v4.yaml` is the pipe_cleaner_rangefix-scale run on
+the v4-calibration pseudo-GT: 640 px, 4 views, `seq_len: 8`, stride 2, memory
+8/8/64, 128 LID depth bins to 24 m, `position_range` y +/-12.5 m (derived from the
+cache by `import_gym_pseudo3d`), batch 8 (batch 16 at seq 8 exceeds 24 GB),
+lr 2.8e-4, 100k optimizer steps, torch.compile. The mixture is 35% composition
+(`data/composition_640_c4_s8`), 50% gym, and 15% MOYO single-person windows
+(`gym_mix_aligned_dirs`/`gym_mix_aligned_fraction`; validated as `val_aligned/*`).
+
+Use the project's Python environment from the repository root. The same Python
+commands work on Windows, Linux, and macOS:
+
+```bash
+python -m unified_perception.tools.training_process start   # start or resume, detached
+python -m unified_perception.tools.training_process status
+python -m unified_perception.tools.training_process stop    # free the GPU
+```
+
+`last.pt` is written atomically every `train.ckpt_every_steps` (500) steps, so
+a stop loses at most that many steps; resuming restores optimizer step, best
+metrics and loss EMA. Output goes to `<output_dir>/console.log`.
+The default config is `configs/gym_pseudo3d_full_v4.yaml`; pass `--config`
+to select another run. Start uses the invoking Python interpreter, not a
+hard-coded virtual environment. Stop kills the recorded training process and
+its DataLoader workers, after verifying process identity; it also recognizes
+existing runs launched by the old PowerShell scripts. Training already running
+does not need to be restarted to use the new status/stop commands.
+
+The launcher inherits environment settings, including `FFMPEG_SHARED_BIN`.
+On Windows, if torchcodec needs shared FFmpeg DLLs, set that variable to your
+own shared FFmpeg `bin` directory; no machine-specific installation path is
+assumed. In Bash, for example:
+
+```bash
+export FFMPEG_SHARED_BIN="/path/to/shared/ffmpeg/bin"
+```
+
+`train.cuda_memory_fraction: 0.9` caps PyTorch's CUDA cache; on Windows an
+uncapped cache spills into shared system memory and slows training several-fold.
+
+### Refresh training visualizations
+
+From the repository root, using the project's Python environment:
+
+```bash
+python -m unified_perception.tools.training_report --open
+```
+
+Defaults: `runs/gym_pseudo3d_full_v4/last.pt`, the run's saved `config.yaml`,
+CUDA if available (otherwise CPU), inference batch size 1, complete held-out
+gym evaluation, four evenly spaced gym examples, representative H36M/MPI
+composition examples, 3D poses, PNG montages, and eight-frame GIFs. Each run
+refreshes `runs/gym_pseudo3d_full_v4/visualizations/index.html` and `summary.json`.
+Selection is fixed by dataset index, not prediction quality, for comparisons
+as training progresses.
+
+The tool snapshots the checkpoint before inference and does **not** stop,
+resume, or modify training. If GPU training is active, free the GPU first and
+resume afterward:
+
+```bash
+python -m unified_perception.tools.training_process stop
+python -m unified_perception.tools.training_report --open
+python -m unified_perception.tools.training_process start
+
+# Different checkpoint, or a quicker gym-only report without GIFs:
+python -m unified_perception.tools.training_report --checkpoint best_val_gym.pt
+python -m unified_perception.tools.training_report --gym-only --no-animations --examples 2
+```
+
+If report generation fails, run `training_process start` to resume training.
+For an automatic resume even on a report error, use Python's `try/finally`:
+
+```python
+import subprocess
+import sys
+
+process = [sys.executable, "-m", "unified_perception.tools.training_process"]
+subprocess.run([*process, "stop"], check=True)
+try:
+    subprocess.run([sys.executable, "-m", "unified_perception.tools.training_report"], check=True)
+finally:
+    subprocess.run([*process, "start"], check=True)
+```
+
+The report command also supports custom run/config/output paths, a score
+threshold, and CPU inference:
+
+```bash
+python -m unified_perception.tools.training_report --help
+python -m unified_perception.tools.training_report --run-dir runs/gym_pseudo3d_full_v4 --device cpu
+```
+
+Relative checkpoint names resolve inside `--run-dir`; config/output overrides
+resolve from the current directory. Use `--output` for a separate report you
+want to retain instead of refreshing the latest report. Run from the repository
+root because dataset paths in the saved config are repository-relative.
+
+Training curves merge restarted TensorBoard streams by logged global step.
+Saved epoch-end mocap/gym/MOYO validation history is shown when available and
+explicitly separated from fresh checkpoint gym metrics. The report identifies
+checkpoint progress, log progress, and actual image/camera/window sizes without
+assuming training is paused or complete. MPJPE/PCK use matched valid GT joints;
+unlabeled frames show only rough GT roots, not fabricated GT skeletons. Example
+metrics are not full mocap validation, and MOYO is not freshly evaluated.
+
+### Six-camera GT / fine-tuned YOLO run
+
+The full-size H36M/MPI composition cache lives under the gitignored
+`data/composition_640_c4_s8`, separate from disposable training runs.
+Regenerate it from the repository root with the project's Python environment:
+
+```bash
+python -m unified_perception.tools.composition_experiment --config configs/composition_640_c4_s8.yaml --output data/composition_640_c4_s8 --build-only --storage npy --workers 8 --recipe-workers 8 --mpi-camera-sets 0,2,7,8 --materialize
+```
+
+This builds source clips, frozen recipes and lossless rendered composites
+(approximately 447 GB), without starting training. Repeating the same command
+resumes completed preparation/generation groups. On Windows, set
+`FFMPEG_SHARED_BIN` as described above. Both full-size training configs use
+`data/composition_640_c4_s8/cache/experiment.json`.
+
+`configs/gym_sixcam_yolov8x_c7.yaml` starts a **fresh** run in
+`runs/gym_sixcam_yolov8x_c7`, separate from the previous v4 run. It uses
+the reviewed six-camera gym GT (0, 1, 2, 4, 5, 6; camera 3 excluded), the
+RGB `curated_v6` fine-tuned YOLOv8x-pose-p6 checkpoint from
+`../cvat_labeling/finetuning/runs/curated_v6/weights/best.pt`, and its actual
+four pre-head feature maps (layers 20, 23, 26, 29; strides 8, 16, 32, 64).
+The image backbone remains frozen, as in the previous run. A new transformer
+and feature projections are initialized; no previous training checkpoint
+is loaded.
+
+Camera counts reflect real inputs; batch padding is masked, never treated as real views:
+
+| Component | Views |
+|---|---:|
+| Reviewed gym | 6 (camera 3 excluded) |
+| H36M / MPI composition | 4 (reuse existing cache unchanged) |
+| Native MOYO | Up to 7, limited by valid calibrated video coverage |
+
+`data.allow_fewer_cameras: true` makes `num_cameras: 7` a ceiling for native
+and gym samples and permits the smaller existing composition cache. Mixed-camera
+batches are padded to the largest view count in that batch, with a boolean
+`camera_valid` mask of shape `(B,T,N)`. Padded images bypass the backbone and
+are excluded from cross-attention before its global camera softmax. Calibration
+padding is invertible, visibility padding is zero, and evaluation counts only
+real cameras. The config uses batch size 4; reduce it if GPU memory is insufficient.
+The learning rate is sqrt-scaled to `1.9796e-4` from batch 8; the 100k optimizer
+update target and 35% composition / 50% gym / 15% MOYO mixture are retained.
+The model runs eagerly to handle varying camera counts without compile
+specialization. Checkpoints are written every 100 optimizer updates.
+
+The importer accepts explicit reviewed camera sets; its default four-camera
+behavior is unchanged. For the six-camera cache, pass
+`--camera-ids 0,1,2,4,5,6` alongside the new GT's `--pseudo-gt`, `--cameras`,
+`--observations`, and `--identity` paths, and
+`--root data_cache/gym_sixcam_20261104_640 --height 640 --width 640`.
+The generated cache index records source paths, camera ordering, coordinate
+offset, and recommended model bounds. Do not mix six-camera observations
+with the old four-camera identity map or GT.
+
+This run imports `pseudo3d_20261104_sixcam_verified` from the gym session's
+external data directory, regenerated from immutable November 2 reviewed
+snapshots (not a live CVAT readback). It contains 21 identities; sparse joint
+masks and root-only supervision are preserved. The model's X range is expanded
+to +/-8.5 m to contain the new GT, while retaining the previous Y/Z bounds.
+`input_manifest.json` in the run directory records input paths and SHA-256
+hashes, including the GT generation manifest and backbone.
+
+```bash
+python -m unified_perception.tools.training_process start --config configs/gym_sixcam_yolov8x_c7.yaml
+python -m unified_perception.tools.training_process status --config configs/gym_sixcam_yolov8x_c7.yaml
+python -m unified_perception.tools.training_report --run-dir runs/gym_sixcam_yolov8x_c7 --open
+```
+
+## Track queries, streaming sequences and registered backbones
+
+### Registered backbones
+
+`model.backbone: <name>` selects a checkpoint from `unified_perception/models/backbones.py`,
+which pins its path, SHA-256 and tapped feature layers (a retrained file at the same path
+fails loudly instead of being picked up silently). `yolo_model_name` still works for
+unregistered experiments. Registered: `yolov8x_pose_p6` (pretrained 1280px baseline),
+`yolov8x_pose_p6_curated_v6` (the c7 run's backbone) and `yolov8x_pose_p6_curated_v7_al`
+(curated_v6 data plus the accepted active-learning round-1 jobs, fine-tuned from the
+pretrained baseline; see `cvat_labeling/finetuning/README.md`).
+
+### TrackFormer-style identity (`model.track_queries: true`)
+
+`models/tracking.py`. The top-k propagated queries are replaced by `max_tracks` track
+slots appended to the detection queries. A valid slot carries the previous frame's
+decoder embedding and predicted root (as its reference point) and owns one identity;
+invalid slots are masked out of self-attention and the losses. The streaming memory
+bank stays as attention context.
+
+- **Training.** A slot whose identity is present is supervised against that person
+  directly (no Hungarian). A slot whose identity exists but is unobserved
+  (`instance_exists` without `gt_valid`) is ignored and kept alive. A slot whose identity
+  is gone is trained as background and freed. People not claimed by a track are
+  Hungarian-matched to detection queries (per decoder layer; the final layer reuses
+  the head's own matches), and those final-layer matches become next frame's tracks.
+  Augmentation: carried tracks are dropped with `track_drop_prob`, so detection queries
+  must re-find them, and a high-scoring unmatched detection is injected as a false track
+  with `track_fp_prob`, which must learn to die. Track state is detached between frames.
+- **Inference.** Active slots continue at `track_keep_score`. Below it they turn inactive,
+  keep their last embedding and position, and can be revived (same id) at
+  `track_birth_score` within `track_max_inactive` frames. Detection queries at
+  `track_birth_score` start new ids unless their root lies within `track_nms_mm` of a
+  reported person. Only reported tracks (`head.track_output["track_ids"] >= 0`) are
+  people; evaluation uses them instead of a score threshold.
+- **Identities.** Providers supply `instance_ids` (stable within a clip, -1 = unknown)
+  and optionally `instance_exists`. The gym provider now keeps everyone present in some
+  reviewed view in its slots (unsupervised when the chosen views don't see them), so
+  identities survive view subsets.
+
+### Arbitrarily long sequences (`data.stream_*`)
+
+`data/streaming.py`. Lengths are in windows of `seq_len` frames: 1 = one window (the
+minimum) and 0 = the whole recording. A clip shorter than a requested length is used
+whole. Every *pass* over a component cuts each of its clips into consecutive pieces at
+fresh random places, so no window is skipped or repeated within a pass, and shuffles the
+pieces. A batch lane walks one piece with the model's memory and track state carried
+across batches, then resets (`stream_reset`) and takes the next. Lanes persist across
+epochs, so hour-long pieces are not truncated (evaluation saves and restores their state).
+Every batch follows the mixture fractions lane by lane: a component owns
+`floor(fraction x batch_size)` lanes outright (`gym_sixcam_track_v1`: gym 2 of 4 lanes in
+every batch, mocap 1), and the leftover lane is shared, a free shared lane taking the
+component furthest below its leftover quota (mocap 0.4 / aligned 0.6 of a lane). The earlier
+rule (a random component per free lane, weighted by fraction / mean piece length estimated
+from one random cut) gave the single 593-window gym training clip 9-65% of lanes depending on
+the seed, with up to two thirds of steps holding no gym lane at all (checked 2026-11-18).
+
+Piece-length distributions are given as the share of a component's windows seen in pieces
+of each length. Domain components (`stream_domain_components`, the long-lived
+gym/monitoring recordings) use `stream_domain_chunks` / `stream_domain_window_share`, and
+the auxiliary true-3D datasets (composition H36M/MPI, MOYO) use `stream_aux_*`.
+`gym_sixcam_track_v1` puts 40% of gym windows in whole recordings and 30% in ~14-minute
+pieces, because the target domain is hours-long continuous monitoring, while the
+auxiliary sets mostly supply short pieces for pose diversity. Raise `gym_sample_fraction`
+to shift more of training toward the domain. With track queries, `val_gym` and
+`val_aligned` stream every held-out clip whole, exactly once.
+
+### Short all-camera invisibility (`data.track_max_gap`)
+
+A run of at most `track_max_gap` frames in which no camera observes a person, *between
+two observations of the same identity*, counts as present but unobserved
+(`data/identity.py: fill_identity_gaps`, computed over the whole recording because only
+the full sequence shows whether the person returns). The track slot is then not trained
+to die. It gets no class or keypoint loss and keeps its last supervised embedding and
+position, exactly as an inactive slot does at inference. Its age (frames since last
+update) enters the slot's time embedding. When the person reappears, the same slot is
+supervised by identity again, so re-acquisition is learned and detection queries are
+pushed away from re-birthing them. Longer absences end the track. Keep `track_max_gap`
+and the inference `track_max_inactive` consistent (both 30 frames = 3 s at the gym
+cache's 10 fps).
+
+### Re-identification (`model.reid_dims > 0`)
+
+`models/reid.py`. Each query gets an identity code that fuses:
+- a learned projection of its decoder embedding. The query regresses 3D keypoints every
+  frame, so body proportions, height and motion are implicit in it; noisy per-frame
+  measurements are never used directly. A per-track EMA (`reid_ema`) denoises it over the
+  track's life;
+- an appearance code: backbone features sampled at the projected keypoints in every valid
+  view, visibility-averaged. There is no gradient into the backbone; only the projection
+  learns.
+
+Training uses a supervised contrastive loss per lane between this window's identity codes
+(per-frame codes and the tracks' EMA codes) and a detached bank of the lane's earlier
+codes: the first `reid_bank_anchors` sightings per identity plus `reid_bank_recent`
+recent ones. Positives therefore span long gaps within a streamed piece.
+
+At inference, a track that ends after living at least `reid_wait_frames` enters the lane's
+gallery. A newly born track stays provisional for `reid_wait_frames` active frames (its
+EMA settles), then takes over the most similar gallery identity, or a still-inactive
+track's identity, if cosine >= `reid_threshold`. Takeovers are reported as aliases
+(`head.track_output["aliases"]`). Evaluation applies them retroactively to the
+provisional frames (`id_switches`, the delayed-decision output) and also reports the
+causal `id_switches_online` and `id_reid_takeovers`. Both settings are inference-only;
+sweep them on a trained checkpoint:
+
+```bash
+python -m unified_perception.tools.sweep_reid --config configs/gym_sixcam_track_v1.yaml --checkpoint runs/gym_sixcam_track_v1/best.pt --wait 5 10 20 40 80 160 --threshold 0.5 0.6 0.7
+```
+
+**Pretrained crop re-ID (`model.reid_external_model`).** A frozen person re-ID network runs
+on per-view crops around each live track's projected joints every `reid_external_stride`
+frames. Crops are taken only for valid track slots, never for detection queries, at the
+re-ID aspect ratio, and views are weighted by how many joints are visible. Each slot keeps
+an EMA of the visibility-weighted multi-view embedding. The EMA is frozen during gaps,
+carried with the track, and fused into the identity code through a learned projection; a
+learned "missing" token stands in until a track's first crop. The network is loaded from
+its own TorchScript file, is not part of checkpoints or the optimizer, and runs in fp16
+on GPU (cosine >= 0.9996 vs fp32).
+
+Current model: fast-reid SBS-R50 trained on MSMT17 (release `msmt_sbs_R50.pth`, SHA-256
+`cd7dc3b3...`, under `../fast-reid/pretrained_download`), exported with
+`tools/export_fastreid.py` to `weights/reid/msmt_sbs_R50.ts` (git-ignored; sidecar JSON
+records provenance):
+
+```bash
+../fast-reid/.venv/Scripts/python.exe unified_perception/tools/export_fastreid.py --fastreid ../fast-reid --config configs/MSMT17/sbs_R50.yml --weights ../fast-reid/pretrained_download/msmt_sbs_R50.pth --output weights/reid/msmt_sbs_R50.ts
+```
+
+Off the shelf, on crops from ground-truth gym keypoints (15 identities, 384 sightings): the
+same/different-person AUC is 0.93 for sightings at least 5 s apart (mean cosine 0.75 vs
+0.46), and val-to-train identity retrieval is 84% rank-1 (chance 7%). At cosine 0.7,
+67% of same-person pairs and 3% of different-person pairs are accepted. The crop branch
+adds about 0.1 s to a 2.3 s training step at stride 4.
+
+At inference, call the model window by window on one clip with `stream_reset` False
+after the first window. State persists on `model.head` (`get_stream_state()` /
+`set_stream_state()`).
+
+### Pending run: `configs/gym_sixcam_track_v1.yaml`
+
+Fresh initialization (no c7 weights), the `yolov8x_pose_p6_curated_v7_al` backbone,
+24 track slots, domain-weighted streaming (gym mostly in whole recordings / 14-minute pieces), 3 s gap bridging and 128-d re-identification (query projection + backbone appearance + pretrained crop re-ID). **Not started**: it waits for the new golden
+ground truth. Point `data.gym_pseudo3d_root` (and the gym provider, if the format
+differs) at it before launching:
+
+```bash
+python -m unified_perception.tools.training_process start --config configs/gym_sixcam_track_v1.yaml
+```
+
+## Approximate 3D ground truth from data_management (golden gym set)
+
+### Building the cache (`tools/import_golden.py`, `data/golden.py`)
+
+The importer reads a data_management `three_d_tracks` label set together with its
+`two_d_tracklets` and `frame_alignment` dependencies, checking every file against the
+SHA-256 recorded in the set. It also reads the calibration the triangulation used and the
+normalized 10 fps videos (frame k = aligned index k). It writes a pinhole image cache in
+the gym layout (`format_version` 3), which the gym provider reads via
+`data.gym_pseudo3d_root`. Sources are never modified.
+
+```bash
+python -m unified_perception.tools.import_golden --store ../data_management/data/labels --tracks-set golden_20250505071549_20250505080000.three_d_tracks.cvat_identity --calibration C:/cvat_labeling_data/20250505071549/pseudo3d_20261031/calibration/v5_tracks_ransac.json --videos C:/cvat_labeling_data/20250505071549/external_autofit_v5mono_20261102/input/pilot/normalized --root data_cache/golden_20250505_640
+```
+
+Geometry, checked on the real data:
+- The calibration lives in a 1280x1280 letterbox canvas, `canvas = native * 0.625 + (0, 160)`.
+  Reprojecting the triangulated joints onto the member 2D detections gives a median
+  residual of 1.7–2.7 px per camera; ignoring the letterbox padding gives ~160 px.
+- Image undistortion uses the full OpenCV distortion with the canvas intrinsics shifted to
+  video pixels, then `alpha=0` and a letterbox resize.
+- YOLO boxes on the videos agree best with the labelled boxes at frame offset 0 on every
+  camera checked, so video frame k is aligned index k.
+
+What each label frame (every 5 frames) contains:
+- **Triangulated targets.** World keypoints and root, converted from inches to mm, with
+  the train-root xy centre subtracted.
+- **Outliers.** Height alone never rejects a point: people jump, hang from pull-up bars and
+  climb ropes. Suspicion becomes uncertainty unless the joint's geometry is also weak
+  (at most 2 reliable views):
+  - points below the floor are dropped;
+  - a joint whose every bone deviates strongly from that person's median bone length is
+    dropped if weak, otherwise kept with sigma raised to at least the deviation;
+  - a one-frame spike against both neighbouring label frames is dropped only if weak or
+    larger than 1 m. At 2 Hz labelling, well-observed fast arm motion such as kettlebell
+    swings looks spike-like.
+
+  Golden set (catalog v8): 40 below floor, 670 + 367 weak inconsistent/spike joints dropped,
+  986 kept with raised sigma, 3,655 well-observed "spikes" kept.
+- **`keypoint_sigma` / `root_sigma` (mm).** For each supporting view, take the
+  reprojection residual × depth / focal length (with a 1.5 px floor) and combine the views
+  by inverse variance. Inflate the result by 1 / sin(best ray angle), then add a 25 mm
+  calibration floor in quadrature. On the golden set the median is 27 mm and the 99th
+  percentile 103 mm.
+- **Frames between labels (`match_root`).** No 3D loss target: linear interpolation over
+  0.5 s is biased for athletic motion (a jump's parabola is off by g·T²/8 ≈ 31 cm at its
+  midpoint; fast repetitive limbs alias completely). The interpolated *root* is kept only
+  as a matching cue (`match_root`, `match_root_valid`) so detection queries can be assigned
+  to present people and trained as present (existence / recall, births), never as a pose
+  or position target. `--interpolated-use loss` restores the legacy interpolated targets
+  (with a motion-inflated sigma).
+- **`observed` (F,P,C) / `kp2d`.** Member 2D detections snapped to the nearest label frame
+  (within 2 frames), in cache pixels, and kept only when inside the undistorted image.
+  People seen this way without a 3D target are *observed but untriangulated*: 581
+  person-frames on the golden set (catalog v8), mostly people visible to a single camera.
+
+### Training on it (`models/supervision.py`)
+
+- **Noisy 3D targets.** Errors within `loss.gt_noise_tolerance × sigma` are free, and the
+  rest is L1 weighted by `gt_sigma_ref_mm / (gt_sigma_ref_mm + sigma)`. Exact mocap GT
+  has sigma = 0 and is plain L1.
+- **Seen but untriangulated people** stay positives, so the model is never taught to drop
+  them. They are matched to queries on 2D reprojection cost (Hungarian `extra_cost`
+  columns, for detections and for track births alike). Their position is supervised by a
+  robust reprojection loss: residual beyond `reproj_tolerance_px`, in units of
+  `reproj_scale_px`, weighted by detector confidence. A track slot holding the identity is
+  supervised by identity, as usual.
+- **Present without any geometry** (no label nearby): a track slot holding them is a
+  positive with no position loss. Detection queries are not matched to them.
+- **Unobserved by every camera:** kept alive without supervision for up to
+  `data.track_max_gap` frames (see above).
+- **Camera dropout** (`data.camera_dropout_prob`, `data/augment.py`). Whether a lane drops
+  cameras is decided once per streamed *piece* (the run of consecutive windows a lane walks
+  across several batches). On a dropout lane every frame keeps an independent random subset
+  of `camera_dropout_min_views`..N-1 views, so coverage changes within and across windows:
+  fragmented, perspective-shifting and single-camera views, never a whole region of the gym
+  dark for a whole recording. Hidden views are masked per frame (`camera_valid`), not removed,
+  and their 2D targets are cleared. The model thus learns single-view 3D from true GT on
+  H36M/MPI/MOYO and from triangulated GT on the gym. A person no kept view sees in a frame
+  is present-but-unobserved in that frame (track kept, no supervision), never a negative.
+- **Evaluation** scores only people with a 3D target geometrically. Reported people that
+  reproject onto a 2D-only person (`eval.reproj_match_px`) count as `two_d_only/recall`,
+  not as false positives. Unmatched predictions up to the number of geometry-less present
+  people are reported as `ambiguous_predictions` instead of false positives.
+
+### Training speed
+
+RTX 4090, 4 lanes, up to 7 cameras, 640 px, `gym_sixcam_track_v1` batches. Pass of
+2026-11-18: 2.05 s -> ~1.55 s per step (peak memory 17.4 -> 15.1 GB). GPU kernels are ~0.7 s of
+that; the rest is Python launching ~24k small kernels (the per-frame track matching is
+inherently sequential). What changed:
+- the frozen backbone runs all frames of the window in chunks of 32 images through a
+  Conv+BN-fused, channels-last copy (~0.33 s of GPU per step; checkpoints keep the unfused keys);
+- the head never waits on the GPU inside the frame loop except once per frame for the
+  Hungarian costs of all lanes: per-person masks come from one host copy per batch, small index
+  lists go up through pinned non-blocking copies (a pageable host-to-device copy waits for all
+  queued work), and next-frame track slots are written with a few batched index ops;
+- denoising queries are built for the whole window at once; MMCV sampling shapes are cached and
+  its float32 value tensor is built once per frame (autograd used to keep 6 copies);
+- per-frame token views come from `unbind` (a `feats[:, t]` slice allocates a full-window
+  gradient in backward, 8 per step);
+- the shared-matching loss, denoising loss and re-ID gather run as single batched passes and
+  read their metrics back in one transfer (verified equal to the per-frame loop to ~1e-7);
+- fused AdamW; the gradient norm is computed once and reused for clipping.
+Tried and dropped: computing the next batch's backbone on a side stream (its separate allocator
+pool pushed reserved memory past 24 GB, and WDDM's system-memory fallback made steps 4x slower;
+on the same stream before backward it gained nothing since backward is GPU-bound), and
+`torch.compile` of the decoder layers (recompiles for every camera-count / slot-state change:
+3.9 s per step).
+
+Evaluation: `val_aligned` decodes MOYO video from Google Drive (~2.5 s per window, ~25 min a
+pass). `data.eval_window_cache` serves it from a local JPEG cache (0.12 s per window, 2.1 GB for
+the 528 windows); prebuild with `python -m unified_perception.tools.cache_eval_windows --config ...`.

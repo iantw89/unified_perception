@@ -1,0 +1,99 @@
+# Fresh run: six reviewed gym views, existing four-view H36M/MPI composition,
+# and up to seven native MOYO views. Padding is masked; no old-run initialization.
+data:
+  provider: gym_mocap_mix
+  image_height: 640
+  image_width: 640
+  num_cameras: 7
+  allow_fewer_cameras: true
+  seq_len: 8
+  # Mixed camera counts are padded and masked, not duplicated.
+  batch_size: 4
+  num_workers: 4
+  max_people: 24
+  stride: 2
+  gpu_decode: false
+  val_fraction: 0.2
+  split_seed: 0
+  pixel_mean: [0.0, 0.0, 0.0]
+  pixel_std: [255.0, 255.0, 255.0]
+  aug_flip_views: false
+  human_prior_repo: ../human_prior
+  human_prior_aligned_dirs:
+    - G:\My Drive\FitnessData\test_output_h36m
+    - G:\My Drive\FitnessData\test_output_mpi3dhp
+  human_prior_target_fps: 10.0
+  human_prior_h36m_dataset_path: G:\My Drive\FitnessData\Human3.6
+  human_prior_moyo_dataset_path: G:\My Drive\FitnessData\MoYo
+  human_prior_mpi_dataset_path: G:\My Drive\FitnessData\mpi_inf_3dhp
+  use_shuffle_buffer: false
+  composition_manifest: data/composition_640_c4_s8/cache/experiment.json
+  composition_original_fraction: 0.25
+  composition_datasets: [h36m, mpi]
+  composition_mpi_masks: background
+  gym_pseudo3d_root: data_cache/gym_sixcam_20261104_640
+  gym_sample_fraction: 0.5
+  gym_mix_aligned_dirs:
+    - G:\My Drive\FitnessData\test_output_moyo
+  gym_mix_aligned_fraction: 0.15
+model:
+  embed_dims: 256
+  position_range: [-8500.0, -12500.0, -200.0, 8500.0, 12500.0, 3000.0]
+  num_joints: 12
+  backbone_type: yolo_pose
+  yolo_model_name: ../cvat_labeling/finetuning/runs/curated_v6/weights/best.pt
+  # Actual four feature inputs of the YOLOv8x-pose-p6 head (strides 8/16/32/64).
+  yolo_feature_indices: [20, 23, 26, 29]
+  yolo_trainable: false
+  yolo_force_download: false
+  depth_num: 128
+  depth_start_mm: 500.0
+  depth_max_mm: 24000.0
+  lid_depth: true
+  num_queries: 64
+  dec_layers: 6
+  dec_heads: 8
+  dec_ffn_dim: 2048
+  dec_num_pts: 13
+  dec_groups: 8
+  dropout: 0.1
+  num_propagated: 8
+  memory_topk: 8
+  memory_len: 64
+  with_dn: true
+  dn_scalar: 10
+  dn_noise_scale: 0.2
+  dn_split: 0.75
+  dn_weight: 1.0
+  use_mmcv_msda: true
+  cost_class: 2.0
+  cost_kpt: 5.0
+  loss_class: 2.0
+  loss_kpt: 5.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+loss:
+  root_weight: 5.0
+train:
+  output_dir: runs/gym_sixcam_yolov8x_c7
+  max_epochs: 100000
+  max_steps: 100000
+  # sqrt-scaled from 2.8e-4 at batch 8 to batch 4.
+  lr: 0.00019796
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  warmup_iters: 200
+  log_interval: 10
+  ckpt_interval: 1
+  ckpt_every_steps: 100
+  cuda_memory_fraction: 0.9
+  eval_interval: 1
+  viz_batch_interval: 5000
+  device: cuda
+  seed: 0
+  resume: null
+  compile_model: false
+eval:
+  pck_thresholds_mm: [50.0, 100.0, 150.0]
+  max_eval_batches: 0
+  match_threshold_mm: 600.0

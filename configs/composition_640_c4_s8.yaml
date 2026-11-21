@@ -1,0 +1,60 @@
+# Lossless 640px cache. Build only; no training is launched.
+# python -m unified_perception.tools.composition_experiment --config configs/composition_640_c4_s8.yaml
+#   --output data/composition_640_c4_s8 --build-only --storage npy --workers 8
+#   --recipe-workers 8 --mpi-camera-sets 0,2,7,8 --materialize
+# H36M: 1,2,3,4. MPI: 0(front),2(left),7(back),8(right); no ceiling views.
+# --materialize adds ~284 GB of lossless frozen RGB (~447 GB total cache),
+# avoiding all runtime decompression/compositing. Without it, NPY sources compose lazily.
+# NPY sources are lossless; construction checks recorded size/mtime, and load_clip
+# verify_hash=True performs an explicit full SHA-256 audit. Old NPZ caches remain supported.
+data:
+  provider: human_prior_aligned
+  human_prior_repo: ../human_prior
+  human_prior_aligned_dirs:
+    - "G:\\My Drive\\FitnessData\\test_output_h36m"
+    - "G:\\My Drive\\FitnessData\\test_output_mpi3dhp"
+  human_prior_h36m_dataset_path: "G:\\My Drive\\FitnessData\\Human3.6"
+  human_prior_mpi_dataset_path: "G:\\My Drive\\FitnessData\\mpi_inf_3dhp"
+  image_height: 640
+  image_width: 640
+  num_cameras: 4
+  seq_len: 8
+  stride: 2
+  human_prior_target_fps: 10
+  composition_mpi_masks: background
+  composition_datasets: [h36m, mpi]
+  composition_manifest: data/composition_640_c4_s8/cache/experiment.json
+  batch_size: 16
+  num_workers: 8
+  max_people: 8
+  use_shuffle_buffer: false
+model:
+  position_range: [-6000, -6000, -200, 6000, 6000, 3000]
+  embed_dims: 256
+  backbone_type: yolo_pose
+  yolo_model_name: yolo11n-pose.pt
+  yolo_trainable: false
+  num_queries: 64
+  num_propagated: 8
+  memory_topk: 8
+  memory_len: 64
+  dec_layers: 6
+  dec_heads: 8
+  dec_ffn_dim: 2048
+  dec_num_pts: 13
+  dec_groups: 8
+  with_dn: true
+train:
+  max_epochs: 10000
+  lr: 0.0002
+  warmup_iters: 200
+  grad_clip: 1.0
+  log_interval: 20
+  ckpt_interval: 1
+  eval_interval: 1
+  compile_model: false
+  device: cuda
+  seed: 0
+eval:
+  pck_thresholds_mm: [50.0, 100.0, 150.0]
+  match_threshold_mm: 600.0

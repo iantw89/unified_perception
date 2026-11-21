@@ -8,6 +8,7 @@ available for auxiliary supervision or monitoring.
 from __future__ import annotations
 
 import contextlib
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -47,8 +48,71 @@ class YOLOPoseBackbone(nn.Module):
         if not trainable:
             for p in self.yolo.parameters():
                 p.requires_grad = False
+            self.yolo.eval()
+        # Frozen trunk: a Conv+BN-fused copy runs the forward (fewer kernels); kept outside the
+        # module tree so checkpoints keep the original (unfused) keys.  Rebuilt on device or
+        # weight changes.
+        self.__dict__["_fused"] = None
+        self._register_load_state_dict_pre_hook(self._drop_fused)
+
+    #: images per frozen-backbone call (no autograd state is kept, so only one chunk's
+    #: activations are alive at a time).
+    chunk_images: int = 32
+    #: forward(..., input_mean=, input_std=) normalizes uint8 input itself (chunk by chunk).
+    normalizes_uint8: bool = True
+    #: frozen trunk in channels_last memory format (faster bf16 convolutions).
+    channels_last: bool = True
+
+    def _drop_fused(self, *args, **kwargs):
+        self.__dict__["_fused"] = None
+
+    def _apply(self, fn, *args, **kwargs):
+        self.__dict__["_fused"] = None
+        return super()._apply(fn, *args, **kwargs)
+
+    def _fused_trunk(self):
+        if self.__dict__["_fused"] is None:
+            fused = copy.deepcopy(self.yolo)
+            if hasattr(fused, "fuse"):
+                fused = fused.fuse(verbose=False)
+            # channels_last: ~15% faster bf16 convolutions on Ada (benchmark 2026-11-18).
+            fused = fused.eval()
+            self.__dict__["_fused"] = fused.to(memory_format=torch.channels_last) if self.channels_last else fused
+        return self.__dict__["_fused"]
+
+    def train(self, mode: bool = True):
+        """A frozen backbone always stays in eval mode (BatchNorm running statistics); setting it
+        once here replaces a recursive train()/eval() toggle over ~1,300 submodules on every
+        forward call (~0.1 s of Python per training step)."""
+        super().train(mode)
+        if not self._trainable:
+            self.yolo.eval()
+        return self
 
     def forward(
+        self,
+        x: torch.Tensor,
+        return_detections: bool = False,
+        conf_thresh: float = 0.25,
+        input_mean: torch.Tensor | None = None,
+        input_std: torch.Tensor | None = None,
+    ):
+        """Chunked front end: uint8 input is normalized with ``input_mean``/``input_std`` one
+        chunk at a time; a frozen backbone runs the fused trunk in chunks of ``chunk_images``."""
+        def prep(images):
+            if images.dtype == torch.uint8:
+                if input_mean is None:
+                    raise ValueError("uint8 images need input_mean / input_std")
+                return (images.float() - input_mean) / input_std
+            return images
+
+        if self._trainable or return_detections or x.shape[0] <= self.chunk_images:
+            return self._forward(prep(x), return_detections, conf_thresh)
+        parts = [self._forward(prep(x[i:i + self.chunk_images]), False, conf_thresh)[0]
+                 for i in range(0, x.shape[0], self.chunk_images)]
+        return [torch.cat(level, dim=0) for level in zip(*parts)], None
+
+    def _forward(
         self,
         x: torch.Tensor,
         return_detections: bool = False,
@@ -74,11 +138,17 @@ class YOLOPoseBackbone(nn.Module):
         """
         y = []
         tapped: dict[int, torch.Tensor] = {}
-        modules = self.yolo.model
-        training_state = self.yolo.training
-        if not self._trainable:
-            self.yolo.eval()
+        save = getattr(self.yolo, "save", None)
+        keep = None if save is None or self._trainable else set(save)
+        if self._trainable:
+            modules = self.yolo.model
         else:
+            modules = self._fused_trunk().model
+            if self.channels_last:
+                x = x.contiguous(memory_format=torch.channels_last)
+        training_state = self.yolo.training
+        toggle = self._trainable and not training_state
+        if toggle:
             self.yolo.train()
         _no_grad_ctx = torch.no_grad() if not self._trainable else contextlib.nullcontext()
         try:
@@ -98,9 +168,12 @@ class YOLOPoseBackbone(nn.Module):
                     # Early exit when detections are not needed (skip FPN + head).
                     if not return_detections and i == self._max_index and not self._trainable:
                         break
-                    y.append(x)
+                    # Keep only outputs a later layer reads (ultralytics ``save``): the full
+                    # list held every activation of the chunk (~GBs at 32 x 640^2 images).
+                    y.append(x if keep is None or i in keep else None)
         finally:
-            self.yolo.train(training_state)
+            if toggle:
+                self.yolo.train(training_state)
 
         features = [tapped[i] for i in self.feature_indices]
         if not return_detections:

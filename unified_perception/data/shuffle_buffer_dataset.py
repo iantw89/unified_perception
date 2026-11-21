@@ -494,7 +494,7 @@ class SequenceBuffer:
         # imgs remains uint8 (T, N, 3, H, W) — normalisation happens on GPU.
         imgs_u8 = seq_data["imgs"][s:e].clone()
 
-        return {
+        sample = {
             "imgs":         imgs_u8,
             "world2img":    torch.from_numpy(seq_data["world2img"][s:e]),
             "intrinsics":   torch.from_numpy(seq_data["intrinsics"][s:e]),
@@ -503,3 +503,7 @@ class SequenceBuffer:
             "seq":          seq_data["seq_id"],
             "start":        start,
         }
+        for key in ("gt_keypoint_frame_valid", "gt_keypoint_valid", "gt_root", "gt_root_valid"):
+            if key in seq_data:
+                sample[key] = torch.from_numpy(seq_data[key][s:e])
+        return sample

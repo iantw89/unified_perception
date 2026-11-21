@@ -7,6 +7,7 @@ scipy>=1.10
 pyyaml>=6.0
 tensorboard
 tqdm>=4.65
+psutil>=5.9
 matplotlib>=3.7
 ultralytics>=8.3
 torchcodec>=0.1

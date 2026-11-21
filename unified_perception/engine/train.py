@@ -52,12 +52,31 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the eager module behind torch.compile, so checkpoints carry plain keys."""
+    return getattr(model, "_orig_mod", model)
+
+
+def _strip_compile_prefix(state: dict) -> dict:
+    return {(k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v for k, v in state.items()}
+
+
+def _save_checkpoint(path: str, payload: dict) -> None:
+    """Write atomically so killing the run mid-save never corrupts the previous file."""
+    temporary = path + ".tmp"
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
 def build_loaders(cfg: Config):
+    from ..data.streaming import (
+        StreamingBatchSampler, StreamingDataset, chunk_policies, streaming_enabled, training_components,
+    )
     worker_count = cfg.data.num_workers
     prefetch_factor = 2 if worker_count > 0 else None
     init_fn = _worker_init_fn if worker_count > 0 else None
 
-    if cfg.data.use_shuffle_buffer:
+    if cfg.data.use_shuffle_buffer and not cfg.data.composition_manifest:
         # IterableDataset: sequences fully decoded into memory; windows assembled
         # by array-slicing.  Each DataLoader worker maintains its own buffer with
         # a background decode thread, eliminating per-window video-seek overhead.
@@ -77,8 +96,32 @@ def build_loaders(cfg: Config):
                 worker_init_fn=init_fn,
             )
         }
+    elif streaming_enabled(cfg):
+        # Lanes walk consecutive windows of a clip; the model carries its
+        # temporal/track state across batches (data/streaming.py).
+        components = training_components(cfg)
+        dataset = StreamingDataset(components, cfg.data.camera_dropout_prob, cfg.data.camera_dropout_min_views)
+        loaders = {
+            "train": DataLoader(
+                dataset,
+                batch_sampler=StreamingBatchSampler(
+                    components, cfg.data.batch_size, max(1, len(dataset) // cfg.data.batch_size),
+                    chunk_policies(cfg, components), seed=cfg.train.seed,
+                ),
+                num_workers=worker_count,
+                collate_fn=collate_batch,
+                pin_memory=True,
+                persistent_workers=(worker_count > 0),
+                prefetch_factor=prefetch_factor,
+                worker_init_fn=init_fn,
+            )
+        }
     else:
-        train_set = MultiViewPoseDataset(cfg, split="train")
+        if cfg.data.provider == "gym_mocap_mix":
+            from ..data.gym_pseudo3d import GymMocapMixDataset
+            train_set = GymMocapMixDataset(cfg, split="train")
+        else:
+            train_set = MultiViewPoseDataset(cfg, split="train")
         loaders = {
             "train": DataLoader(
                 train_set,
@@ -95,21 +138,103 @@ def build_loaders(cfg: Config):
         }
 
     val_nw = cfg.data.num_workers // 2
-    provider = build_provider(cfg.data.provider, cfg, "val")
-    all_seq_ids = list({s[0] for s in provider.list_samples()})
-    val_set = ShuffleBufferDataset(provider, all_seq_ids, cfg)
+    if cfg.data.composition_manifest:
+        val_set = MultiViewPoseDataset(cfg, split="val")
+    else:
+        provider = build_provider(cfg.data.provider, cfg, "val")
+        all_seq_ids = list({s[0] for s in provider.list_samples()})
+        val_set = ShuffleBufferDataset(provider, all_seq_ids, cfg)
     loaders["val"] = DataLoader(
         val_set,
         batch_size=cfg.data.batch_size,
         shuffle=False,
         num_workers=val_nw,
         collate_fn=collate_batch,
-        drop_last=True,
+        drop_last=not bool(cfg.data.composition_manifest),
         prefetch_factor=prefetch_factor if val_nw > 0 else None,
         pin_memory=True,
         worker_init_fn=init_fn if val_nw > 0 else None,
     )
+    if cfg.data.provider == "gym_mocap_mix" and cfg.model.track_queries:
+        # Identity continuity needs whole clips: stream every held-out clip once.
+        from ..data.streaming import StreamingDataset, aligned_component, evaluation_lanes, gym_component
+        streams = {"val_gym": ([gym_component(cfg, "val")], None)}
+        if cfg.data.gym_mix_aligned_dirs and cfg.data.gym_mix_aligned_fraction > 0:
+            streams["val_aligned"] = ([aligned_component(cfg, "val", cache=True)], 512)
+        for name, (components, cap) in streams.items():
+            loaders[name] = DataLoader(
+                StreamingDataset(components),
+                batch_sampler=evaluation_lanes(components, cfg.data.batch_size, cap),
+                num_workers=val_nw,
+                collate_fn=collate_batch,
+                prefetch_factor=prefetch_factor if val_nw > 0 else None,
+                pin_memory=True,
+                worker_init_fn=init_fn if val_nw > 0 else None,
+            )
+    elif cfg.data.provider == "gym_mocap_mix":
+        # Separate held-out gym tail, evaluated alongside mocap val as "val_gym".
+        from ..data.gym_pseudo3d import GymPseudo3DDataset
+        loaders["val_gym"] = DataLoader(
+            GymPseudo3DDataset(cfg, split="val"),
+            batch_size=cfg.data.batch_size,
+            shuffle=False,
+            num_workers=val_nw,
+            collate_fn=collate_batch,
+            drop_last=False,
+            prefetch_factor=prefetch_factor if val_nw > 0 else None,
+            pin_memory=True,
+            worker_init_fn=init_fn if val_nw > 0 else None,
+        )
+        if cfg.data.gym_mix_aligned_dirs and cfg.data.gym_mix_aligned_fraction > 0:
+            # Held-out single-person aligned windows (fixed random subset), as "val_aligned".
+            from ..data.gym_pseudo3d import AlignedSingleDataset
+            loaders["val_aligned"] = DataLoader(
+                AlignedSingleDataset(cfg, split="val", limit=512),
+                batch_size=cfg.data.batch_size,
+                shuffle=False,
+                num_workers=val_nw,
+                collate_fn=collate_batch,
+                drop_last=False,
+                prefetch_factor=prefetch_factor if val_nw > 0 else None,
+                pin_memory=True,
+                worker_init_fn=init_fn if val_nw > 0 else None,
+            )
     return loaders
+
+
+def _nonfinite_report(ts: "TrainStep", batch: dict, out_dir: str, step: int) -> None:
+    """Describe a non-finite loss (terms, outputs, inputs) and save the batch without images."""
+    terms = {k: v for k, v in (ts.metrics or {}).items() if isinstance(v, float) and not math.isfinite(v)}
+    print(f"    non-finite loss terms: {terms or 'none reported'}")
+    for name in ("cls_scores", "kpts_norm"):
+        value = getattr(ts, name, None)
+        if isinstance(value, torch.Tensor):
+            bad = ~torch.isfinite(value.float())
+            if bad.any():
+                layers = bad.flatten(1).any(1).nonzero().flatten().tolist() if value.dim() > 1 else []
+                lanes = bad.transpose(0, 1).flatten(1).any(1).nonzero().flatten().tolist() if value.dim() > 2 else []
+                print(f"    {name}: {int(bad.sum())} non-finite values (decoder layers {layers}, lanes {lanes})")
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor) and value.is_floating_point() and not torch.isfinite(value).all():
+            print(f"    input {key}: {int((~torch.isfinite(value)).sum())} non-finite values")
+    print(f"    sequences: {list(zip(batch.get('seq', []), batch.get('start', [])))}")
+    folder = os.path.join(out_dir, "nonfinite_batches")
+    os.makedirs(folder, exist_ok=True)
+    keep = {k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in batch.items() if k != "imgs"}
+    torch.save({"step": step, "metrics": ts.metrics, "batch": keep}, os.path.join(folder, f"step_{step:07d}.pt"))
+
+
+def _release_step(ts: "TrainStep", model: torch.nn.Module) -> None:
+    """Drop a skipped step's graph and inputs, and restart streaming state (it may hold NaNs)."""
+    try:
+        ts.free_inputs()
+    except AttributeError:
+        pass   # already freed
+    ts.loss = ts.cls_scores = ts.kpts_norm = ts.dn_meta = ts.dets_2d = None
+    head = getattr(getattr(model, "_orig_mod", model), "head", None)
+    if head is not None and hasattr(head, "reset_memory"):
+        head.reset_memory()
+        head.track_output = None
 
 
 def _per_module_grad_norms(model: torch.nn.Module) -> list[tuple[str, float]]:
@@ -132,7 +257,11 @@ def _gpu_mem_gb() -> tuple[float, float]:
 
 
 def train(cfg: Config):
+    if cfg.train.max_steps < 0:
+        raise ValueError("train.max_steps cannot be negative")
     device = resolve_device(cfg.train.device)
+    if device.type == "cuda" and cfg.train.cuda_memory_fraction > 0:
+        torch.cuda.set_per_process_memory_fraction(cfg.train.cuda_memory_fraction)
     set_seed(cfg.train.seed)
     os.makedirs(cfg.train.output_dir, exist_ok=True)
     save_config(cfg, os.path.join(cfg.train.output_dir, "config.yaml"))
@@ -147,19 +276,20 @@ def train(cfg: Config):
     # Applied after each batch is moved to device, avoiding float32 IPC traffic.
     _norm_mean = torch.tensor(cfg.data.pixel_mean, dtype=torch.float32, device=device).view(1, 1, 1, 3, 1, 1)
     _norm_std  = torch.tensor(cfg.data.pixel_std,  dtype=torch.float32, device=device).view(1, 1, 1, 3, 1, 1)
-    criterion = SetCriterion(cfg.model)
+    criterion = SetCriterion(cfg.model, cfg.loss)
 
     if cfg.train.compile_model:
         if hasattr(torch, "compile"):
             torch._dynamo.config.capture_scalar_outputs = True
             print("[train] torch.compile(model)  (first steps will be slower during kernel compilation)")
-            model = cast(torch.nn.Module, torch.compile(model))
+            model = cast(UnifiedPerceptionModel, torch.compile(model))
             criterion = cast(torch.nn.Module, torch.compile(criterion))
         else:  # pragma: no cover
             print("[train] torch.compile not available (PyTorch < 2.0) — skipping")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
+        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay,
+        fused=device.type == "cuda",
     )
 
     # AMP: bfloat16 on CUDA for ~2× throughput on Tensor Cores.
@@ -177,23 +307,44 @@ def train(cfg: Config):
         writer = None
 
     csv_path = os.path.join(cfg.train.output_dir, "training_log.csv")
-    csv_file = open(csv_path, "w", newline="")
+    append_log = bool(cfg.train.resume and os.path.exists(cfg.train.resume) and os.path.exists(csv_path))
+    csv_file = open(csv_path, "a" if append_log else "w", newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["epoch", "split", "loss", "loss_cls", "loss_kpt",
-                          "grad_norm", "gpu_alloc_gb_avg", "gpu_alloc_gb_peak",
-                          "mpjpe_mm", "f1"])
+    if not append_log:
+        csv_writer.writerow(["epoch", "split", "loss", "loss_cls", "loss_kpt",
+                              "grad_norm", "gpu_alloc_gb_avg", "gpu_alloc_gb_peak",
+                              "mpjpe_mm", "f1"])
 
     start_epoch = 0
     global_step = 0
+    optimizer_steps = 0
+    best_mpjpe = float("inf")
+    best_extra: dict[str, float] = {}
+    loss_ema: float | None = None          # global EMA for divergence detection
     if cfg.train.resume and os.path.exists(cfg.train.resume):
         ckpt = torch.load(cfg.train.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        _unwrap(model).load_state_dict(_strip_compile_prefix(ckpt["model"]))
         optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        print(f"Resumed from {cfg.train.resume} at epoch {start_epoch}")
+        # Mid-epoch checkpoints restart their (freshly shuffled) epoch.
+        start_epoch = ckpt.get("epoch", 0) + (1 if ckpt.get("epoch_complete", True) else 0)
+        global_step = ckpt.get("global_step", 0)
+        optimizer_steps = ckpt.get("optimizer_steps", 0)
+        best_mpjpe = ckpt.get("best_mpjpe", best_mpjpe)
+        best_extra = dict(ckpt.get("best_extra", {}))
+        loss_ema = ckpt.get("loss_ema")
+        if cfg.train.max_steps and "optimizer_steps" not in ckpt:
+            raise ValueError("A step-budgeted resume requires an optimizer_steps checkpoint")
+        # Avoid replaying the identical sample order after every restart.
+        set_seed(cfg.train.seed + optimizer_steps)
+        print(f"Resumed from {cfg.train.resume} at epoch {start_epoch}, optimizer step {optimizer_steps}")
 
-    best_mpjpe = float("inf")
-    loss_ema: float | None = None          # global EMA for divergence detection
+    def checkpoint(epoch: int, epoch_complete: bool = True) -> dict:
+        return {"model": _unwrap(model).state_dict(), "optimizer": optimizer.state_dict(),
+                "epoch": epoch, "epoch_complete": epoch_complete, "global_step": global_step,
+                "optimizer_steps": optimizer_steps, "best_mpjpe": best_mpjpe, "best_extra": best_extra,
+                "loss_ema": loss_ema, "cfg": config_to_dict(cfg)}
+
+    last_path = os.path.join(cfg.train.output_dir, "last.pt")
     _EMA_DECAY     = 0.98
     _SPIKE_FACTOR  = 8.0                   # flag if loss > 8× EMA
     _EMA_WARMUP    = 50                    # steps before spike detection activates
@@ -206,6 +357,8 @@ def train(cfg: Config):
 
     epoch_peak_mem_gb: float = 0.0
     for epoch in range(start_epoch, cfg.train.max_epochs):
+        if cfg.train.max_steps and optimizer_steps >= cfg.train.max_steps:
+            break
         model.train()
         running = {}
         epoch_peak_mem_gb = 0.0
@@ -213,7 +366,12 @@ def train(cfg: Config):
         steps_this_epoch = 0
         skipped_steps = 0
         pbar = tqdm(train_loader, desc=f"epoch {epoch}")
+        t_ready = time.perf_counter()
         for it, batch in enumerate(pbar):
+            # Time blocked on the DataLoader since the previous step finished (input-bound if large).
+            data_wait = time.perf_counter() - t_ready
+            if cfg.train.max_steps and optimizer_steps >= cfg.train.max_steps:
+                break
             # Determine whether this step needs 2-D detections for visualisation
             # so we can fold it into the single training forward pass.
             viz_batch_interval = cfg.train.viz_batch_interval
@@ -236,9 +394,12 @@ def train(cfg: Config):
                     f"\n[step {global_step}] LOSS={loss_val} — NaN/Inf detected,"
                     f" skipping backward (epoch {epoch}, batch {it})"
                 )
+                _nonfinite_report(ts, batch, cfg.train.output_dir, global_step)
+                _release_step(ts, model)
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 skipped_steps += 1
+                t_ready = time.perf_counter()
                 continue
 
             # Update loss EMA
@@ -253,8 +414,9 @@ def train(cfg: Config):
                 )
 
             # LR warmup.
-            if global_step < cfg.train.warmup_iters:
-                scale = (global_step + 1) / cfg.train.warmup_iters
+            warmup_step = optimizer_steps if cfg.train.max_steps else global_step
+            if warmup_step < cfg.train.warmup_iters:
+                scale = (warmup_step + 1) / cfg.train.warmup_iters
                 for g in optimizer.param_groups:
                     g["lr"] = cfg.train.lr * scale
 
@@ -273,9 +435,11 @@ def train(cfg: Config):
                 )
                 for mn, mv in module_norms[:8]:
                     print(f"    {mv:12.2f}  {mn}")
+                _release_step(ts, model)
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 skipped_steps += 1
+                t_ready = time.perf_counter()
                 continue
 
             if grad_norm >= _warn_thresh:
@@ -288,8 +452,11 @@ def train(cfg: Config):
                     print(f"    {mv:12.2f}  {mn}")
 
             ts.optimize(cfg.train.grad_clip)
+            optimizer_steps += 1
             global_step += 1
             steps_this_epoch += 1
+            if cfg.train.ckpt_every_steps and optimizer_steps % cfg.train.ckpt_every_steps == 0:
+                _save_checkpoint(last_path, checkpoint(epoch, epoch_complete=False))
 
             # Per-step visualisation: reuse cls_scores / kpts_norm from the
             # training forward (no second forward pass, no model.eval() toggle).
@@ -338,6 +505,7 @@ def train(cfg: Config):
 
             ts.metrics["grad_norm"] = grad_norm
             ts.metrics["gpu_alloc_gb"] = alloc_gb
+            ts.metrics["data_wait_s"] = data_wait
 
             for k, v in ts.metrics.items():
                 running[k] = running.get(k, 0.0) + (v if isinstance(v, float) else 0.0)
@@ -349,6 +517,7 @@ def train(cfg: Config):
                     gnorm=f"{grad_norm:.2f}",
                     mem=f"{alloc_gb:.1f}/{rsvd_gb:.1f}G",
                     peak=f"{peak_gb:.1f}G",
+                    wait=f"{data_wait:.2f}s",
                 )
                 if writer:
                     for k, v in ts.metrics.items():
@@ -357,17 +526,19 @@ def train(cfg: Config):
                     writer.add_scalar("sys/gpu_rsvd_gb",  rsvd_gb,  global_step)
                     if loss_ema is not None:
                         writer.add_scalar("train/loss_ema", loss_ema, global_step)
+            t_ready = time.perf_counter()
 
         n = max(steps_this_epoch, 1)
         train_loss = running.get("loss", 0.0) / n
         avg_grad   = running.get("grad_norm", 0.0) / n
+        avg_wait   = running.get("data_wait_s", 0.0) / n
         elapsed    = time.perf_counter() - t_epoch_start
         sps        = steps_this_epoch / max(elapsed, 1e-3)
         print(
             f"[epoch {epoch}] loss={train_loss:.4f}  ema={loss_ema:.4f}"
             f"  gnorm={avg_grad:.3f}  peak_mem={epoch_peak_mem_gb:.2f} GB"
             f"  steps={steps_this_epoch}  skipped={skipped_steps}"
-            f"  {sps:.1f} step/s  ({elapsed:.0f}s)"
+            f"  {sps:.2f} step/s  data_wait={avg_wait:.2f}s/step  ({elapsed:.0f}s)"
         )
         csv_writer.writerow([epoch, "train", train_loss,
                               running.get("loss_cls", 0) / n,
@@ -390,23 +561,35 @@ def train(cfg: Config):
             csv_writer.writerow([epoch, "val", "", "", "", "", "", "",
                                   val_metrics["mpjpe_mm"], val_metrics["f1"]])
             csv_file.flush()
-            if val_metrics["matched_persons"] > 0 and val_metrics["mpjpe_mm"] < best_mpjpe:
+            if (val_metrics["matched_persons"] > 0 and math.isfinite(val_metrics["mpjpe_mm"])
+                    and val_metrics["mpjpe_mm"] < best_mpjpe):
                 best_mpjpe = val_metrics["mpjpe_mm"]
-                torch.save(
-                    {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                     "epoch": epoch, "cfg": config_to_dict(cfg)},
-                    os.path.join(cfg.train.output_dir, "best.pt"),
-                )
+                _save_checkpoint(os.path.join(cfg.train.output_dir, "best.pt"), checkpoint(epoch))
+            for val_name in sorted(k for k in loaders if k.startswith("val_")):
+                extra = run_eval(model, loaders[val_name], cfg, device, max_batches=max_vb)
+                print(f"[epoch {epoch}] {val_name}: " + ", ".join(f"{k}={v:.3f}" for k, v in extra.items()))
+                if writer:
+                    for k, v in extra.items():
+                        writer.add_scalar(f"{val_name}/{k}", v, global_step)
+                csv_writer.writerow([epoch, val_name, "", "", "", "", "", "",
+                                      extra["mpjpe_mm"], extra["f1"]])
+                csv_file.flush()
+                best_key = f"best_{val_name}"
+                if (extra["matched_persons"] > 0 and math.isfinite(extra["mpjpe_mm"])
+                        and extra["mpjpe_mm"] < best_extra.get(best_key, float("inf"))):
+                    best_extra[best_key] = extra["mpjpe_mm"]
+                    _save_checkpoint(os.path.join(cfg.train.output_dir, f"{best_key}.pt"), checkpoint(epoch))
 
-        if epoch % cfg.train.ckpt_interval == 0:
-            torch.save(
-                {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                 "epoch": epoch, "cfg": config_to_dict(cfg)},
-                os.path.join(cfg.train.output_dir, "last.pt"),
-            )
+        if epoch % cfg.train.ckpt_interval == 0 or (cfg.train.max_steps and optimizer_steps >= cfg.train.max_steps):
+            _save_checkpoint(last_path, checkpoint(epoch))
 
     csv_file.close()
     if writer:
         writer.close()
+    if cfg.train.max_steps and optimizer_steps < cfg.train.max_steps:
+        raise RuntimeError(
+            f"Only {optimizer_steps}/{cfg.train.max_steps} optimizer steps completed; "
+            "increase train.max_epochs or investigate skipped steps."
+        )
     print(f"Training complete. Best val MPJPE: {best_mpjpe:.2f} mm")
     return model

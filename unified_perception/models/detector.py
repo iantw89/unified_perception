@@ -22,7 +22,10 @@ import torch
 import torch.nn as nn
 
 from ..config import Config
+from .backbones import resolve_backbone, resolve_repo_path
+from .reid import ExternalReID
 from .sparse_head import SparseHead
+from .tracking import TrackManager
 from .yolo_backbone import YOLOPoseBackbone
 
 
@@ -35,10 +38,18 @@ class UnifiedPerceptionModel(nn.Module):
         self.register_buffer(
             "position_range", torch.tensor(m.position_range, dtype=torch.float32)
         )
+        # uint8 inputs are normalized one frame at a time (saves the full float32 window).
+        self.register_buffer("input_mean", torch.tensor(cfg.data.pixel_mean, dtype=torch.float32).view(1, 1, 3, 1, 1),
+                             persistent=False)
+        self.register_buffer("input_std", torch.tensor(cfg.data.pixel_std, dtype=torch.float32).view(1, 1, 3, 1, 1),
+                             persistent=False)
 
+        model_name, feature_indices = m.yolo_model_name, m.yolo_feature_indices
+        if m.backbone:
+            model_name, feature_indices = resolve_backbone(m.backbone)
         self.backbone = YOLOPoseBackbone(
-            model_name=m.yolo_model_name,
-            feature_indices=m.yolo_feature_indices,
+            model_name=model_name,
+            feature_indices=feature_indices,
             trainable=m.yolo_trainable,
         )
         # Probe per-level channel counts and build 1×1 linear projections
@@ -80,15 +91,50 @@ class UnifiedPerceptionModel(nn.Module):
             noise_scale=m.dn_noise_scale,
             split=m.dn_split,
             use_mmcv_msda=m.use_mmcv_msda,
+            max_tracks=m.max_tracks if m.track_queries else 0,
+            track_manager=TrackManager(m, m.position_range) if m.track_queries else None,
+            reid_dims=m.reid_dims if m.track_queries else 0,
+            reid_appearance=m.reid_appearance,
+            reid_ema=m.reid_ema,
+            external_reid=(ExternalReID(resolve_repo_path(m.reid_external_model))
+                           if m.track_queries and m.reid_dims and m.reid_external_model else None),
+            external_stride=m.reid_external_stride,
+            pixel_mean=cfg.data.pixel_mean,
+            pixel_std=cfg.data.pixel_std,
         )
 
     # ------------------------------------------------------------------ #
+    def _run_backbone(self, flat_images: torch.Tensor, active: Optional[torch.Tensor],
+                      return_detections: bool = False):
+        """Backbone features of (M, 3, H, W) images, zero for inactive (padded) views."""
+        # Exclude padding from the backbone, including trainable BatchNorm statistics.
+        # uint8 images are normalized chunk by chunk inside the backbone call (a float32
+        # copy of the whole window would cost ~1 GB per batch).
+        images = flat_images if active is None else flat_images[active]
+        mean, std = self.input_mean.view(1, 3, 1, 1), self.input_std.view(1, 3, 1, 1)
+        if getattr(self.backbone, "normalizes_uint8", False):
+            feats_list, dets = self.backbone(images, return_detections=return_detections,
+                                             input_mean=mean, input_std=std)
+        else:  # other backbones (e.g. test stubs) take normalized float images
+            if images.dtype == torch.uint8:
+                images = (images.float() - mean) / std
+            feats_list, dets = self.backbone(images, return_detections=return_detections)
+        if active is not None:
+            padded_feats = []
+            for feat in feats_list:
+                padded = feat.new_zeros(flat_images.shape[0], *feat.shape[1:])
+                padded[active] = feat
+                padded_feats.append(padded)
+            feats_list = padded_feats
+        return feats_list, dets
+
     def _encode_frame(
         self,
-        imgs_t:            torch.Tensor,           # (B, N, 3, H, W)
+        imgs_t:            torch.Tensor,           # (B, N, 3, H, W) uint8 or normalized float
         world2img_t:       torch.Tensor,           # (B, N, 4, 4)
         intrinsics_t:      Optional[torch.Tensor], # (B, N, 4, 4) or None
         return_detections: bool = False,
+        camera_valid: Optional[torch.Tensor] = None,
     ):
         """Run the backbone and build per-token calibration codes.
 
@@ -106,10 +152,17 @@ class UnifiedPerceptionModel(nn.Module):
         B, N, _, H, W = imgs_t.shape
         C = self.embed_dims
 
-        # Run backbone once for all B*N images.
-        feats_list, dets_flat = self.backbone(
-            imgs_t.reshape(B * N, 3, H, W), return_detections=return_detections
-        )
+        active = None if camera_valid is None else camera_valid.reshape(-1)
+        feats_list, dets_flat = self._run_backbone(imgs_t.reshape(B * N, 3, H, W), active,
+                                                   return_detections)
+        if active is not None:
+            if return_detections:
+                detections = iter(dets_flat)
+                template = dets_flat[0]
+                dets_flat = [
+                    next(detections) if valid else {key: value[:0] for key, value in template.items()}
+                    for valid in active.tolist()
+                ]
         # feats_list: [Tensor(B*N, C_l, Hp_l, Wp_l) for each level l]
 
         all_tokens: list[torch.Tensor] = []
@@ -158,6 +211,10 @@ class UnifiedPerceptionModel(nn.Module):
         gt_keypoints_norm:  Optional[torch.Tensor] = None,
         gt_valid:           Optional[torch.Tensor] = None,
         return_2d:          bool = False,
+        gt_keypoint_valid:  Optional[torch.Tensor] = None,
+        camera_valid:       Optional[torch.Tensor] = None,  # (B, T, N), True for real views
+        track_targets:      Optional[dict] = None,
+        stream_reset:       Optional[torch.Tensor] = None,  # (B,) bool
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict], Optional[list]]:
         """Forward pass over a temporal window.
 
@@ -171,26 +228,61 @@ class UnifiedPerceptionModel(nn.Module):
         For ``B=1`` the index ``t * N + c`` gives frame t, camera c.
 
         ``gt_keypoints_norm``/``gt_valid`` are used only during training (DN).
+        ``camera_valid`` excludes padded views from the backbone and attention.
+        Masked views have empty 2-D detections, preserving flat-list indexing.
+
+        With ``model.track_queries``, ``track_targets`` (normalized GT plus
+        ``instance_ids``/``exists``) drives identity assignment in training and
+        ``self.head.track_output`` holds per-query track ids / assignments.
+        ``stream_reset`` (B,) continues the temporal state of lanes that are
+        False from the previous call (streaming); None resets every lane.
         """
         B, T, N, _, H, W = imgs.shape
-        feats, mlns = [], []
-        spatial_shapes = None
+        if N > self.cam_embed.shape[0]:
+            raise ValueError("Input camera count exceeds configured num_cameras")
+        if camera_valid is not None:
+            if camera_valid.shape != (B, T, N) or camera_valid.dtype != torch.bool:
+                raise ValueError("camera_valid must be boolean with shape (B,T,N)")
+            if not camera_valid.any(dim=-1).all():
+                raise ValueError("Every sample frame must contain at least one valid camera")
+            identity = torch.eye(4, device=world2img.device, dtype=world2img.dtype)
+            world2img = torch.where(camera_valid[..., None, None], world2img, identity)
+            if intrinsics is not None:
+                intrinsics = torch.where(camera_valid[..., None, None], intrinsics, identity)
         dets_2d: list = []
-        for t in range(T):
-            k_t = None if intrinsics is None else intrinsics[:, t]
-            ft, mt, spatial_shapes, dets_t = self._encode_frame(
-                imgs[:, t], world2img[:, t], k_t, return_detections=return_2d
-            )
-            if return_2d:
+        if return_2d:
+            # Detections are reported time-major: encode frame by frame.
+            feats, mlns = [], []
+            spatial_shapes = None
+            for t in range(T):
+                k_t = None if intrinsics is None else intrinsics[:, t]
+                ft, mt, spatial_shapes, dets_t = self._encode_frame(
+                    imgs[:, t], world2img[:, t], k_t, return_detections=True,
+                    camera_valid=None if camera_valid is None else camera_valid[:, t],
+                )
                 dets_2d.extend(dets_t)   # B*N dicts per timestep → T*B*N total
-            feats.append(ft)
-            mlns.append(mt)
-        feats = torch.stack(feats, dim=1)   # (B, T, N*sum_L, C)
-        mlns  = torch.stack(mlns,  dim=1)   # (B, T, N*sum_L, 14)
+                feats.append(ft)
+                mlns.append(mt)
+            feats = torch.stack(feats, dim=1)   # (B, T, N*sum_L, C)
+            mlns  = torch.stack(mlns,  dim=1)   # (B, T, N*sum_L, 14)
+        else:
+            # All frames of the window in one pass (frames are independent here): one
+            # backbone sweep in large chunks instead of T small ones (kernel-launch bound).
+            ft, mt, spatial_shapes, _ = self._encode_frame(
+                imgs.reshape(B * T, N, *imgs.shape[3:]), world2img.reshape(B * T, N, 4, 4),
+                None if intrinsics is None else intrinsics.reshape(B * T, N, 4, 4),
+                camera_valid=None if camera_valid is None else camera_valid.reshape(B * T, N),
+            )
+            feats = ft.view(B, T, *ft.shape[1:])   # (B, T, N*sum_L, C)
+            mlns = mt.view(B, T, *mt.shape[1:])    # (B, T, N*sum_L, 14)
 
         cls_scores, kpts_norm, dn_meta = self.head(
             feats, mlns, world2img, spatial_shapes, (H, W),
-            gt_keypoints_norm, gt_valid,
+            gt_keypoints_norm, gt_valid, gt_keypoint_valid,
+            camera_valid=camera_valid,
+            images=imgs if self.head.external_reid is not None else None,
+            track_targets=track_targets,
+            stream_reset=stream_reset,
         )
         return cls_scores, kpts_norm, dn_meta, dets_2d if return_2d else None
 

@@ -4,3 +4,9 @@ __pycache__/
 runs/
 .venv/
 *.mp4
+
+# Generated datasets, debug overlays, and converter test fixtures
+data_cache/
+data/
+# Exported pretrained re-ID networks (tools/export_fastreid.py)
+weights/reid/

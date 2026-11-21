@@ -8,14 +8,30 @@ accordingly.
 
 from __future__ import annotations
 
-from typing import Sequence, Tuple, Union
+from typing import Tuple, Union, overload
 
 import cv2
 import numpy as np
 import torch
-import torchvision.transforms.functional as F
+import torch.nn.functional as F
 
 _Array = Union[np.ndarray, torch.Tensor]
+
+
+@overload
+def resize_image_and_intrinsics(image: torch.Tensor, K: np.ndarray, out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, np.ndarray]: ...
+
+
+@overload
+def resize_image_and_intrinsics(image: torch.Tensor, K: torch.Tensor, out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+
+@overload
+def resize_image_and_intrinsics(image: np.ndarray, K: np.ndarray, out_hw: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]: ...
+
+
+@overload
+def resize_image_and_intrinsics(image: np.ndarray, K: torch.Tensor, out_hw: Tuple[int, int]) -> Tuple[np.ndarray, torch.Tensor]: ...
 
 
 def resize_image_and_intrinsics(
@@ -40,9 +56,9 @@ def resize_image_and_intrinsics(
     canvas = image
     if isinstance(image, torch.Tensor):
         t = image
-        if new_h != h and new_w != w:
+        if new_h != h or new_w != w:
             # (H, W, C) → (1, C, H, W) for interpolate, then back
-            t = image.permute(2, 0, 1).unsqueeze(0)
+            t = image.permute(2, 0, 1).unsqueeze(0).float()
             # Use area interpolation for downsampling (matches cv2.INTER_AREA);
             # bilinear for upsampling.  area mode has no align_corners parameter.
             if new_h < h or new_w < w:
@@ -50,7 +66,11 @@ def resize_image_and_intrinsics(
             else:
                 t = F.interpolate(t, size=(new_h, new_w), mode="bilinear", align_corners=False)
             t = t.squeeze(0).permute(1, 2, 0)
-        if pad_top or pad_left:
+            if not image.is_floating_point():
+                t = t.round()
+            t = t.to(image.dtype)
+        canvas = t
+        if new_h != out_h or new_w != out_w:
             canvas = torch.zeros((out_h, out_w, image.shape[2]), dtype=image.dtype, device=image.device)
             canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = t
     else:
@@ -59,11 +79,18 @@ def resize_image_and_intrinsics(
         canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
 
     # Intrinsics arithmetic is identical for both array types.
-    K2 = K.copy() if isinstance(K, np.ndarray) else K.clone()
-    K2[0, :] *= s
-    K2[1, :] *= s
-    K2[0, 2] += pad_left
-    K2[1, 2] += pad_top
+    if isinstance(K, np.ndarray):
+        K2 = K.copy()
+        K2[0, :] *= s
+        K2[1, :] *= s
+        K2[0, 2] += pad_left
+        K2[1, 2] += pad_top
+    else:
+        K2 = K.clone()
+        K2[0, :] = K2[0, :] * s
+        K2[1, :] = K2[1, :] * s
+        K2[0, 2] = K2[0, 2] + pad_left
+        K2[1, 2] = K2[1, 2] + pad_top
     return canvas, K2
 
 

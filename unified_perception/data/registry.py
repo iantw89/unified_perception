@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Type
+from typing import Callable, Dict, Type, TypeVar
 
 from .interface import DataProvider
 
 PROVIDER_REGISTRY: Dict[str, Type[DataProvider]] = {}
+_Provider = TypeVar("_Provider", bound=DataProvider)
 
 
-def register_provider(name: str) -> Callable[[Type[DataProvider]], Type[DataProvider]]:
-    def _decorator(cls: Type[DataProvider]) -> Type[DataProvider]:
+def register_provider(name: str) -> Callable[[Type[_Provider]], Type[_Provider]]:
+    def _decorator(cls: Type[_Provider]) -> Type[_Provider]:
         PROVIDER_REGISTRY[name] = cls
         return cls
 

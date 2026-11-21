@@ -1,7 +1,7 @@
 SYNTHETIC MULTI-PERSON DATA AUGMENTATION PLAN
 ==========================================
 
-Status: Design confirmed by the user; no implementation authorized by this plan.
+Status: Design confirmed; implementation authorized on 2026-10-22.
 Date: 2026-10-22
 
 1. OBJECTIVE AND AGREED SCOPE
@@ -12,6 +12,9 @@ performance. Generate coherent multi-view, temporal RGB examples containing
 multiple people, with corresponding calibrated 3D targets.
 
 Initial supported scene size: 1-8 people. Retain original single-person samples.
+Augmentation sources are H36M and MPI-INF-3DHP only. MOYO is excluded from
+foreground extraction, background templates, and composed scenes; its original
+data remains available to the ordinary provider.
 Allow partial and complete image occlusion, but reject physical collisions using
 conservative 3D body proxies. Always include every composed person as a target,
 even when fully hidden. Visibility is diagnostic, not a supervision filter.
@@ -62,22 +65,16 @@ Sparse 3D joints do not establish body silhouettes or exact pixel depths.
 Sorting people solely by pelvis depth cannot correctly resolve interleaved
 limbs. Full surface-depth compositing is not promised by this first version.
 
-The current checkout lacks unified_perception/data/, although documentation and
-training reference it. Identifying or recovering that package is a prerequisite.
-Do not silently replace it with a speculative new provider implementation.
-
 3. DELIVERY PHASE A: DATA AND BASELINE AUDIT
 ------------------------------------------
 
-3.1 Recover the data path
-- Identify the intended data package/revision and recover it through a separate,
-  explicit prerequisite if needed.
+3.1 Audit the existing data path
 - Confirm actual provider outputs, batching, temporal windows, padding, person
   validity, calibration transformations, image resizing, and split behavior.
 - Keep changes in this repository; do not incidentally rewrite human_prior.
 
 3.2 Inventory eligible assets and capture groups
-- Inventory H36M, MoYo, and MPI-Inf-3DHP sources supported by the existing setup.
+- Inventory H36M and MPI-Inf-3DHP augmentation sources.
 - Record source dataset, subject, sequence, camera IDs, timestamps/frame indices,
   frame rates, world units, coordinate convention, K/R/T, distortion, and image
   dimensions. Hash canonical calibration/image-transform metadata.
@@ -95,7 +92,7 @@ Do not silently replace it with a speculative new provider implementation.
   windows cannot cross splits. Respect subject isolation where required.
 - Verify source clips, cached assets, recipes, and benchmark examples inherit
   their source split. No training donor or base may enter validation/test.
-- Establish an explicit test split if the recovered provider only defines
+- Establish an explicit test split if the existing provider only defines
   train/validation, documenting its dataset-appropriate grouping policy.
 
 3.4 Establish baselines
@@ -140,11 +137,22 @@ before training on composed RGB.
 --------------------------------------------------
 
 5.1 Locally extract person foregrounds
-- Select and pin a locally executed segmentation method and model weights;
-  review dependency/license compatibility before introducing them.
+- Use a label-gated per-pixel background average, not a raw temporal median or
+  a neural segmentation model. Accumulate a pixel's RGB only when the projected
+  body (including an inferred head and conservative margin) is away from it.
+- Build templates independently per capture group, camera, and source split.
+  Store mean, variation, and clean-observation count. Unknown background pixels
+  are not silently filled; insufficient support near a person rejects extraction.
+- Subtract the template with per-pixel noise/lighting tolerance; constrain the
+  result to the projected person region and remove small optical/noise artifacts.
+- Suppress color-preserving brightness-only shadows near feet, outside narrow body/shoe
+  regions. Recover weak but noise-significant differences near bones only when
+  connected to strong foreground evidence, preserving similarly colored calves.
+  Restrict gap filling so it cannot bridge arbitrary floor/shadow pixels.
+  Version extraction changes and regenerate/review masks before approval.
 - Extract every participating source person's mask, including the base person,
   at the exact RGB frames/cameras used by the provider.
-- Cache masks or mattes with source, model, preprocessing, and version hashes.
+- Cache masks with source, background-template, preprocessing, and version hashes.
 - Check masks against projected joints, temporal continuity, image borders,
   disconnected artifacts, and obvious background contamination.
 - Reject unrepresentable source occlusion, missing foregrounds, bad masks, and
@@ -176,6 +184,11 @@ before training on composed RGB.
   available geometry cannot resolve reliably. Do not use pelvis sorting as an
   unconditional fallback.
 - Do not paste donor backgrounds or silently inpaint unseen body surfaces.
+- At visible boundaries between overlapping person masks, randomly mix visible
+  RGB within a 3x3 neighborhood to reduce halo delineation. Leave background
+  edges, interiors, geometry, masks, and visibility labels unchanged. Seed from
+  source provenance for reproducible recipes; vary weights by pixel/frame.
+  Re-review version-2 composites for remaining halos and temporal flicker.
 - Apply shared image preprocessing consistently to masks, pixels, and cameras.
 - Audit cutout edges, source occluders, donor shadows, lighting differences,
   background mismatch, and temporal flicker. This remains approximate image
@@ -232,7 +245,7 @@ Requirements:
 - Freeze validation/test manifests and processing versions before final runs.
 - Support materializing benchmark examples and inspection videos as needed.
 
-Integrate with the recovered provider/dataset contract and existing collation,
+Integrate with the existing provider/dataset contract and existing collation,
 normalization, image transforms, configuration, and visualization patterns.
 Make composition opt-in so existing original-data behavior remains available.
 
@@ -329,8 +342,8 @@ performance only. Synthetic benchmark gains do not prove real-scene realism.
 10. IMPLEMENTATION DELIVERABLES AND STOP CONDITIONS
 -------------------------------------------------
 
-After separate authorization to implement:
-1. Resolve the data-package prerequisite and document actual source contracts.
+Implementation sequence:
+1. Audit the existing data package and document actual source contracts.
 2. Add focused multi-person model/loss/metric correctness tests and necessary
    demonstrated bug fixes, without adding a tracking objective.
 3. Add local foreground extraction, versioned caches, geometry checks, recipe
@@ -347,10 +360,10 @@ end-to-end tiny generation/loading/forward/loss/evaluation smoke test before
 large generation or training. Verify original-data behavior remains available.
 
 Stop and revisit the design if calibration/splits cannot be established, the
-data package cannot be recovered, masks/orderings are unreliable, useful
+masks/orderings are unreliable, useful
 collision-free native combinations are too scarce, or acceptance gates fail.
 Do not silently introduce rendering, unsupported world transforms, visibility
 filtering, changed learning objectives, or cross-split source reuse.
 
-This document is the planning deliverable. No model, data, dependency, or
-training implementation has been performed as part of writing it.
+This document records the agreed design. Implementation and measured results
+must be reported separately; planned acceptance gates are not claimed outcomes.

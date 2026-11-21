@@ -177,6 +177,7 @@ def save_train_viz(
         gt_valid = batch["gt_valid"][0].numpy()       # (T, P)
 
         T, N = imgs_np.shape[:2]
+        camera_valid = batch.get("camera_valid")
 
         kpts_last = kpts_norm[-1, 0].detach().cpu()              # (T, Q, J, 3) norm
         kpts_mm   = kpts_last * (pr[3:6] - pr[:3]) + pr[:3]     # mm
@@ -194,6 +195,13 @@ def save_train_viz(
             best_q = int(scores[t].argmax().item())
             tiles = []
             for c in range(N):
+                if camera_valid is not None and not camera_valid[0, t, c]:
+                    # contiguous (zeros_like of the transposed view is not; OpenCV rejects it)
+                    bgr = np.zeros(imgs_np[t, c].transpose(1, 2, 0).shape, np.uint8)
+                    cv2.putText(bgr, "Hidden / padded view", (5, bgr.shape[0] - 7),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1, cv2.LINE_AA)
+                    tiles.append(bgr)
+                    continue
                 bgr = cv2.cvtColor(
                     imgs_np[t, c].transpose(1, 2, 0), cv2.COLOR_RGB2BGR
                 )

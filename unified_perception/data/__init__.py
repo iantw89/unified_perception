@@ -1,4 +1,5 @@
 from . import backends as _backends  # noqa: F401 - import registers providers
+from . import gym_pseudo3d as _gym_pseudo3d  # noqa: F401 - register sparse providers
 from .collate import collate_batch
 from .dataset import MultiViewPoseDataset
 from .shuffle_buffer_dataset import ShuffleBufferDataset
