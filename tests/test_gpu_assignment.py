@@ -238,3 +238,19 @@ def test_train_step_matches_reference_with_crop_appearance(seed):
                                                      codes=codes, ema=ema, app=app)
     assert torch.equal(new.app_valid, ref_new.app_valid)
     torch.testing.assert_close(new.app_ema, ref_new.app_ema)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_solver_survives_nonfinite_costs(device):
+    cost = torch.rand(3, 16, 5)
+    cost[0, :, 2] = float("nan")          # a person whose whole cost column is NaN
+    cost[1, 4, :] = float("inf")          # a query with infinite cost to everyone
+    available = torch.ones(3, 5, dtype=torch.bool)
+    out = ga.solve_assignment(cost.to(device), available.to(device))
+    if device == "cuda":
+        torch.cuda.synchronize()          # an out-of-range scatter would surface here
+    out = out.cpu()
+    assert ((out >= -1) & (out < 5)).all()
+    for b in range(3):                    # each person matched at most once
+        matched = out[b][out[b] >= 0]
+        assert len(matched) == len(set(matched.tolist()))

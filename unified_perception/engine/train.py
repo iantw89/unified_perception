@@ -398,6 +398,9 @@ def train(cfg: Config, config_path: str | None = None, argv: list[str] | None = 
                         bank.reset()
                 skipped_steps += 1
                 return False
+            if values.get("num_nonfinite_cost"):
+                print(f"\n[step {step_no}] WARNING: {values['num_nonfinite_cost']} non-finite matching costs "
+                      f"(finite loss); sequences: {ctx['sequences']}")
             optimizer_steps += 1
             steps_this_epoch += 1
             loss_ema = loss_val if loss_ema is None else _EMA_DECAY * loss_ema + (1 - _EMA_DECAY) * loss_val

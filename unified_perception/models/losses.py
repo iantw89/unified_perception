@@ -213,6 +213,8 @@ class SetCriterion(torch.nn.Module):
                   "num_pos": n_pos, "num_kpt": terms["n_kpt"], "num_root": terms["n_root"],
                   "loss_reproj": loss_reproj, "num_reproj": terms["n_reproj"],
                   "num_track_pairs": matched[..., num_det:].sum()}
+        if out.get("nonfinite_cost") is not None:
+            values["num_nonfinite_cost"] = out["nonfinite_cost"]
         if self.reid_device is not None and "id_codes" in out:
             loss_reid, anchors = self._device_reid_loss(out, target)
             values["num_reid_anchors"] = anchors

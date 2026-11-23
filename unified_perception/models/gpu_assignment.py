@@ -100,6 +100,7 @@ def _reprojection_cost(sup, t: int, preds: torch.Tensor, scale_px: float) -> tor
     return ((err * mask).sum(dim=(1, 4)) / mask.sum(dim=(1, 4)).clamp(min=1) / scale_px).to(preds.dtype)
 
 
+_BIG_COST = 1.0e6
 _TRITON_OK: bool | None = None
 
 
@@ -130,7 +131,11 @@ def solve_assignment(cost: torch.Tensor, available: torch.Tensor) -> torch.Tenso
         return out[:, :Q]
     if P > Q:
         raise ValueError(f"{P} people exceed {Q} detection queries")
-    rows = torch.where(available[:, :, None], cost.transpose(1, 2), 0.0).float().contiguous()  # (B, P, Q)
+    rows = torch.where(available[:, :, None], cost.transpose(1, 2), 0.0).float()               # (B, P, Q)
+    # The solver runs without validation (no sync): a NaN/inf row would come back unassigned (-1).
+    # Non-finite costs (a diverged forward) become a large finite cost instead; the step's loss is
+    # non-finite too and is skipped on the device (engine/step.py), callers count these entries.
+    rows = torch.nan_to_num(rows, nan=_BIG_COST, posinf=_BIG_COST, neginf=-_BIG_COST).contiguous()
     solver = _triton_solver() if rows.is_cuda else None
     if solver is not None:
         col = solver.batch_linear_assignment(rows, validation="off")             # (B, P)
@@ -143,8 +148,9 @@ def solve_assignment(cost: torch.Tensor, available: torch.Tensor) -> torch.Tenso
             col[b, torch.as_tensor(r)] = torch.as_tensor(c)
         col = col.to(cost.device)
     people = torch.arange(P, device=cost.device).expand(B, P)
-    index = torch.where(available, col, Q)                                       # Q = discard column
-    out.scatter_(1, index, torch.where(available, people, -1))
+    ok = available & (col >= 0) & (col < Q)          # never scatter an out-of-range column
+    index = torch.where(ok, col, Q)                                              # Q = discard column
+    out.scatter_(1, index, torch.where(ok, people, -1))
     return out[:, :Q]
 
 
@@ -203,6 +209,8 @@ def train_step(manager, state, num_det: int, cls, kpts, feat, targets: dict, t: 
     free = valid & ~claimed & sup.matchable[:, t]
     cost = batch_match_cost(sup, t, cls[:, :num_det], kpts[:, :num_det], manager.costs)
     det_target = solve_assignment(cost, free)                                   # (B, num_det)
+    bad = (~torch.isfinite(cost) & free[:, None, :]).sum()
+    manager.nonfinite_cost = bad if getattr(manager, "nonfinite_cost", None) is None else manager.nonfinite_cost + bad
 
     target = torch.cat([det_target, torch.where(tracked, track_g, -1)], dim=1)
     excluded = torch.cat([torch.zeros_like(det_target, dtype=torch.bool), ~slot_valid | stale], dim=1)

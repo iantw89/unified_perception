@@ -667,7 +667,11 @@ class SparseHead(nn.Module):
 
         self.track_output = None
         if tracking:
+            nonfinite = getattr(self.track_manager, "nonfinite_cost", None) if self.track_manager else None
+            if self.track_manager is not None:
+                self.track_manager.nonfinite_cost = None
             self.track_output = {
+                "nonfinite_cost": nonfinite,   # gpu_assignment: non-finite matching costs this window
                 "num_det": self.num_query,
                 "slot_valid": torch.stack(slot_valid_frames, dim=1),     # (B, T, K)
                 "track_ids": torch.stack(track_id_frames, dim=1),        # (B, T, Qm), -1 = none
