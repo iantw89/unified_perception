@@ -46,7 +46,7 @@ def main():
         else:
             cfg.train.resume = args.resume
 
-    train(cfg)
+    train(cfg, config_path=args.config, argv=sys.argv)
 
 
 if __name__ == "__main__":

@@ -256,7 +256,7 @@ def _gpu_mem_gb() -> tuple[float, float]:
     return 0.0, 0.0
 
 
-def train(cfg: Config):
+def train(cfg: Config, config_path: str | None = None, argv: list[str] | None = None):
     if cfg.train.max_steps < 0:
         raise ValueError("train.max_steps cannot be negative")
     device = resolve_device(cfg.train.device)
@@ -337,6 +337,15 @@ def train(cfg: Config):
         # Avoid replaying the identical sample order after every restart.
         set_seed(cfg.train.seed + optimizer_steps)
         print(f"Resumed from {cfg.train.resume} at epoch {start_epoch}, optimizer step {optimizer_steps}")
+
+    # Immutable per-launch experiment record (engine/run_manifest.py); never fatal.
+    try:
+        from .run_manifest import write_launch_record
+        record_path = write_launch_record(cfg, loaders, config_path=config_path, argv=argv,
+                                          resumed_optimizer_steps=optimizer_steps)
+        print(f"[train] launch record: {record_path}")
+    except Exception as exc:  # pragma: no cover
+        print(f"[train] WARNING: launch record not written: {type(exc).__name__}: {exc}")
 
     def checkpoint(epoch: int, epoch_complete: bool = True) -> dict:
         return {"model": _unwrap(model).state_dict(), "optimizer": optimizer.state_dict(),
