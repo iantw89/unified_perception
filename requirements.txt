@@ -13,6 +13,9 @@ ultralytics>=8.3
 torchcodec>=0.1
 torch-tb-profiler
 triton-windows ; sys_platform == 'win32'
-triton ; sys_platform != 'win32'# Batched GPU Hungarian (model.gpu_assignment). 0.1.0 runs the Triton kernel; its dispatcher only
+triton ; sys_platform != 'win32'
+# Batched GPU Hungarian (model.gpu_assignment). 0.1.0 runs the Triton kernel; its dispatcher only
 # enables it on Linux, so models/gpu_assignment.py calls the kernel module directly on Windows too.
 torch-linear-assignment==0.1.0
+# Tests only: DINOv3 port parity against Hugging Face (tests/test_vit_backbone.py).
+transformers>=4.56

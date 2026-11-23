@@ -22,7 +22,8 @@ import torch
 import torch.nn as nn
 
 from ..config import Config
-from .backbones import resolve_backbone, resolve_repo_path
+from .backbones import BACKBONES, resolve_backbone, resolve_repo_path
+from .vit_backbone import DinoV3SimpleFPNBackbone, fpn_levels_for
 from .reid import ExternalReID
 from .sparse_head import SparseHead
 from .tracking import TrackManager
@@ -57,11 +58,17 @@ class UnifiedPerceptionModel(nn.Module):
         model_name, feature_indices = m.yolo_model_name, m.yolo_feature_indices
         if m.backbone:
             model_name, feature_indices = resolve_backbone(m.backbone)
-        self.backbone = YOLOPoseBackbone(
-            model_name=model_name,
-            feature_indices=feature_indices,
-            trainable=m.yolo_trainable,
-        )
+        if m.backbone and BACKBONES[m.backbone].kind == "vit":
+            self.backbone = DinoV3SimpleFPNBackbone(
+                model_name, arch=BACKBONES[m.backbone].arch, out_channels=m.embed_dims,
+                trainable_blocks=m.vit_trainable_blocks, compile_trunk=m.vit_compile,
+                fpn_levels=m.vit_fpn_levels or fpn_levels_for(cfg.data.image_height, cfg.data.image_width))
+        else:
+            self.backbone = YOLOPoseBackbone(
+                model_name=model_name,
+                feature_indices=feature_indices,
+                trainable=m.yolo_trainable,
+            )
         # Probe per-level channel counts and build 1×1 linear projections
         # to unify all scales to embed_dims.
         with torch.no_grad():
@@ -172,7 +179,7 @@ class UnifiedPerceptionModel(nn.Module):
         feats_list, dets_flat = self._run_backbone(
             imgs_t.reshape(B * N, 3, H, W), active if active_index is None else active_index, return_detections)
         if active is not None:
-            if return_detections:
+            if return_detections and dets_flat is not None:   # (ViT backbones report none)
                 detections = iter(dets_flat)
                 template = dets_flat[0]
                 dets_flat = [
@@ -283,7 +290,7 @@ class UnifiedPerceptionModel(nn.Module):
                     imgs[:, t], world2img[:, t], k_t, return_detections=True,
                     camera_valid=None if camera_valid is None else camera_valid[:, t],
                 )
-                dets_2d.extend(dets_t)   # B*N dicts per timestep → T*B*N total
+                dets_2d.extend(dets_t or [])   # (ViT backbones report none) B*N dicts per timestep → T*B*N total
                 feats.append(ft)
                 mlns.append(mt)
             feats = torch.stack(feats, dim=1)   # (B, T, N*sum_L, C)

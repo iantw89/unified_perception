@@ -22,6 +22,10 @@ class YoloBackbone:
     sha256: str
     feature_indices: tuple[int, ...]
     description: str
+    #: "yolo_pose" (tapped ultralytics layers) or "vit" (DINOv3 + SimpleFPN, models/vit_backbone.py;
+    #: ``arch`` names the ViT size).
+    kind: str = "yolo_pose"
+    arch: str = ""
 
 
 # YOLOv8x-pose-p6 head inputs (strides 8/16/32/64).
@@ -41,6 +45,12 @@ BACKBONES: dict[str, YoloBackbone] = {
         "8dd7315144cf47a129f0968c2bf56e0d242a20c989bb507e14db0e78425e1343",
         _P6_FEATURES, "curated_v6 data + accepted active-learning round-1 jobs (task 247); "
                       "fine-tuned from the pretrained 1280px baseline"),
+    # DINOv3 ViT-B/16 distilled on LVD-1689M (DINOv3 License; gated download, weights/ is not
+    # committed).  Strides 8/16/32 (optionally 64) through the SimpleFPN.
+    "dinov3_vitb16_lvd1689m": YoloBackbone(
+        "weights/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+        "73cec8be7427c8655ceced13ce62f6e20a1fa90d1b4d4a550df17a1144081a7c",
+        (), "DINOv3 ViT-B/16 LVD-1689M pretrain (frozen) + ViTDet SimpleFPN", kind="vit", arch="vitb16"),
 }
 
 

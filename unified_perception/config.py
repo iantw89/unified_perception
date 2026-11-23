@@ -170,6 +170,16 @@ class ModelConfig:
     yolo_trainable: bool = True
     yolo_force_download: bool = True
 
+    # ViT backbone (registered ``backbone`` of kind "vit": DINOv3 + SimpleFPN, models/vit_backbone.py).
+    # Last N ViT blocks (+ final norm) trained; the rest run as a frozen bf16 copy.
+    vit_trainable_blocks: int = 0
+    # torch.compile the frozen trunk (compute-bound: ~8% on a 4090; first steps pay compilation).
+    vit_compile: bool = False
+    # SimpleFPN levels: 3 = strides 8/16/32, 4 adds stride 64.  0 = by image size
+    # (models/vit_backbone.py: fpn_levels_for): 3 at 640 px (a 10 x 10 stride-64 map is too coarse
+    # to help), 4 from 1024 px (e.g. 1280 px: 20 x 20, needed for large people).
+    vit_fpn_levels: int = 0
+
     # --- 3D position encoder ---
     depth_num: int = 64
     depth_start_mm: float = 500.0
