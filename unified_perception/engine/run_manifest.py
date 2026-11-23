@@ -50,7 +50,7 @@ SECTIONS: dict[str, list[str]] = {
     ],
     "mixture": [
         "data.provider", "data.gym_pseudo3d_root", "data.gym_sample_fraction",
-        "data.gym_mix_aligned_dirs", "data.gym_mix_aligned_fraction",
+        "data.gym_mix_aligned_dirs", "data.gym_mix_aligned_fraction", "data.train_window_cache",
         "data.composition_manifest", "data.composition_original_fraction", "data.composition_datasets",
         "data.composition_mpi_masks", "data.human_prior_aligned_dirs", "data.val_fraction", "data.split_seed",
     ],

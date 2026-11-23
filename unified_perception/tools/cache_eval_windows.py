@@ -2,8 +2,9 @@
 
     python -m unified_perception.tools.cache_eval_windows --config configs/gym_sixcam_track_v1.yaml
 
-Fills exactly the windows the trainer's val_aligned pass reads (the same capped clip list),
-in parallel worker processes.  Safe to interrupt and rerun: finished windows are skipped.
+Fills exactly the windows the trainer's val_aligned pass reads (the same capped clip list), or
+with ``--split train`` every training aligned window (served when ``data.train_window_cache``
+is on), in parallel worker processes.  Safe to interrupt and rerun: finished windows are skipped.
 """
 
 from __future__ import annotations
@@ -41,15 +42,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--split", choices=["val", "train"], default="val")
     args = parser.parse_args()
     cfg = load_config(args.config)
     if not cfg.data.eval_window_cache:
         raise SystemExit("data.eval_window_cache is not set in this config")
-    component = aligned_component(cfg, "val", cache=True)
-    keys = list(dict.fromkeys(item[1] for batch in evaluation_lanes([component], cfg.data.batch_size,
-                                                                    VAL_ALIGNED_CAP) for item in batch))
+    component = aligned_component(cfg, args.split, cache=True)
+    if args.split == "val":
+        keys = list(dict.fromkeys(item[1] for batch in evaluation_lanes([component], cfg.data.batch_size,
+                                                                        VAL_ALIGNED_CAP) for item in batch))
+    else:
+        keys = [key for group in component.groups for key in group]
     todo = [k for k in keys if not component.load.path(k).exists()]
-    print(f"val_aligned: {len(keys)} windows, {len(keys) - len(todo)} cached, {len(todo)} to build "
+    print(f"{args.split} aligned: {len(keys)} windows, {len(keys) - len(todo)} cached, {len(todo)} to build "
           f"-> {component.load.root}", flush=True)
     start = time.perf_counter()
     loader = DataLoader(_Fill(component.load, todo), batch_size=1, num_workers=args.workers,

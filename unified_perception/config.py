@@ -88,6 +88,9 @@ class DataConfig:
     # val_aligned (data/streaming.py: CachedWindows).  Empty = off.  A subfolder per content
     # fingerprint; prebuild with  python -m unified_perception.tools.cache_eval_windows.
     eval_window_cache: str = ""
+    # Serve the *training* aligned windows through the same cache (folder per split).  Misses
+    # decode from the source and fill the cache; prebuild with cache_eval_windows --split train.
+    train_window_cache: bool = False
 
     # --- Shuffle buffer (IterableDataset mode) ---
     # When True, use ShuffleBufferDataset instead of MultiViewPoseDataset.

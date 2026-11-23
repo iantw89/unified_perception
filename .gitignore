@@ -7,6 +7,8 @@ runs/
 
 # Generated datasets, debug overlays, and converter test fixtures
 data_cache/
-data/
+/data/
 # Exported pretrained re-ID networks (tools/export_fastreid.py)
 weights/reid/
+weights/dinov2/
+weights/dinov3/
