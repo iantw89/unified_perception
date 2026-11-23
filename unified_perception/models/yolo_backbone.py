@@ -85,7 +85,11 @@ class YOLOPoseBackbone(nn.Module):
         if self.__dict__["_fused"] is None:
             fused = copy.deepcopy(self.yolo)
             if hasattr(fused, "fuse"):
-                fused = fused.fuse(verbose=False)
+                # Fuse in full precision: ultralytics' Conv+BN fusion uses torch.mm, which an
+                # enclosing autocast region (the first training forward) would run in bf16 and leave
+                # bf16 weights in this fp32 trunk -- breaking the non-autocast (evaluation) path.
+                with torch.autocast("cuda", enabled=False), torch.autocast("cpu", enabled=False):
+                    fused = fused.fuse(verbose=False)
             # channels_last: ~15% faster bf16 convolutions on Ada (benchmark 2026-11-18).
             fused = fused.eval()
             self.__dict__["_fused"] = fused.to(memory_format=torch.channels_last) if self.channels_last else fused

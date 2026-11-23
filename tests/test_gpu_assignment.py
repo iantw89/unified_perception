@@ -254,3 +254,18 @@ def test_solver_survives_nonfinite_costs(device):
     for b in range(3):                    # each person matched at most once
         matched = out[b][out[b] >= 0]
         assert len(matched) == len(set(matched.tolist()))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA autocast")
+def test_fused_trunk_built_under_autocast_stays_fp32():
+    from unified_perception.config import load_config
+    from unified_perception.models import UnifiedPerceptionModel
+    cfg = load_config("configs/gym_sixcam_track_v1.yaml")
+    model = UnifiedPerceptionModel(cfg).cuda()
+    bb = model.backbone
+    x = torch.rand(2, 3, 640, 640, device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        bb._forward(x)                    # first build happens inside the training autocast
+    assert all(p.dtype == torch.float32 for p in bb._fused_trunk().parameters())
+    with torch.no_grad():
+        bb._forward(x)                    # evaluation path: no autocast, fp32 input
