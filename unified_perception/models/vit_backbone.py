@@ -215,6 +215,8 @@ class DinoV3SimpleFPNBackbone(nn.Module):
     chunk_images: int = 32
     #: forward(..., input_mean=, input_std=) normalizes uint8 input itself.
     normalizes_uint8: bool = True
+    #: forward(..., valid_hw=) runs only each image's valid top-left region.
+    accepts_valid_hw: bool = True
 
     def __init__(self, weights: str | None, arch: str = "vitb16", out_channels: int = 256,
                  trainable_blocks: int = 0, frozen_dtype: torch.dtype = torch.bfloat16,
@@ -302,9 +304,53 @@ class DinoV3SimpleFPNBackbone(nn.Module):
             x = block(x, cos, sin)
         return self.vit.grid(x, h, w)
 
-    def forward(self, x: torch.Tensor, return_detections: bool = False, conf_thresh: float = 0.25,
-                input_mean: torch.Tensor | None = None, input_std: torch.Tensor | None = None):
+    def _levels(self, x: torch.Tensor, input_mean, input_std) -> list[torch.Tensor]:
         feats = self._vit_features(x, input_mean, input_std)
         amp = torch.is_autocast_enabled(feats.device.type)
         feats = feats.to(torch.get_autocast_dtype(feats.device.type) if amp else torch.float32)
-        return self.fpn(feats), None
+        return self.fpn(feats)
+
+    @property
+    def crop_alignment(self) -> int:
+        """Valid regions are rounded up to the coarsest FPN stride (32 px, or 64 with four levels),
+        so every level of an image pads back onto the canvas grid exactly."""
+        return 8 * 2 ** (self.fpn.num_levels - 1)
+
+    def forward(self, x: torch.Tensor, return_detections: bool = False, conf_thresh: float = 0.25,
+                input_mean: torch.Tensor | None = None, input_std: torch.Tensor | None = None,
+                valid_hw: torch.Tensor | None = None):
+        """``valid_hw`` (M, 2), on the host: each image's valid (h, w) at the top-left of the
+        canvas (native-aspect batches, data/collate.py).  Images are grouped by their valid size
+        rounded up to :attr:`crop_alignment`; each group runs the ViT and FPN on that region
+        only, and its levels are zero-padded (bottom / right) back to the canvas grid."""
+        H, W = x.shape[-2:]
+        A = self.crop_alignment
+        if H % A or W % A:
+            raise ValueError(f"Canvas {H}x{W} must be a multiple of {A} (the coarsest FPN stride)")
+        if valid_hw is None or x.shape[0] == 0:
+            return self._levels(x, input_mean, input_std), None
+        hw = valid_hw.to(torch.long).cpu()
+        h = ((hw[:, 0] + A - 1) // A * A).clamp(A, H)
+        w = ((hw[:, 1] + A - 1) // A * A).clamp(A, W)
+        keys = h * (W + 1) + w
+        groups = keys.unique().tolist()
+        if groups == [H * (W + 1) + W]:
+            return self._levels(x, input_mean, input_std), None
+        strides = [8 * 2 ** i for i in range(self.fpn.num_levels)]
+        outputs = None
+        for key in groups:
+            gh, gw = divmod(int(key), W + 1)
+            if len(groups) == 1:
+                index, part = None, x
+            else:
+                index = (keys == key).nonzero().squeeze(1)
+                index = index.pin_memory().to(x.device, non_blocking=True) if x.is_cuda else index.to(x.device)
+                part = x.index_select(0, index)
+            levels = self._levels(part[..., :gh, :gw], input_mean, input_std)
+            levels = [F.pad(level, (0, (W - gw) // s, 0, (H - gh) // s)) for level, s in zip(levels, strides)]
+            if index is None:
+                return levels, None
+            if outputs is None:
+                outputs = [level.new_zeros((x.shape[0], *level.shape[1:])) for level in levels]
+            outputs = [out.index_copy(0, index, level) for out, level in zip(outputs, levels)]
+        return outputs, None

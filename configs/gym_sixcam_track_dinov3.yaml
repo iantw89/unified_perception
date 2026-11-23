@@ -12,6 +12,9 @@ data:
   provider: gym_mocap_mix
   image_height: 640
   image_width: 640
+  # Native aspect, no letterbox: long side 640 (gym 480 x 640, MOYO 468 x 640 / portrait, mocap
+  # 640 x 640), top-left on a stride-32 canvas; the ViT runs each camera's valid region only.
+  image_long_side: 640
   num_cameras: 7
   allow_fewer_cameras: true
   seq_len: 8
@@ -62,7 +65,7 @@ data:
   camera_dropout_min_views: 1
   # Golden GT (data_management label sets -> tools/import_golden.py): 7 cameras, 10 min at
   # 10 fps, triangulated targets with per-joint sigma + 2-D targets for untriangulated people.
-  gym_pseudo3d_root: data_cache/golden_20250505_640
+  gym_pseudo3d_root: data_cache/golden_20250505_480x640
   gym_sample_fraction: 0.5
   gym_mix_aligned_dirs:
     - G:\My Drive\FitnessData\test_output_moyo
@@ -71,6 +74,8 @@ data:
   # cached locally as JPEG (0.1 s per window, ~2 GB).  Prebuild:
   #   python -m unified_perception.tools.cache_eval_windows --config configs/gym_sixcam_track_v1.yaml
   eval_window_cache: data_cache/eval_windows
+  # MOYO training windows from the same local cache (prebuild: cache_eval_windows --split train).
+  train_window_cache: true
 model:
   embed_dims: 256
   position_range: [-8500.0, -14000.0, -200.0, 8500.0, 14000.0, 3000.0]  # golden cache recommendation

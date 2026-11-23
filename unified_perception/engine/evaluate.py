@@ -15,6 +15,14 @@ from ..models.supervision import project
 tqdm = get_tqdm()
 
 
+def _accepts(model, name: str) -> bool:
+    """Whether ``model.forward`` takes keyword ``name`` (evaluation also runs test stub models)."""
+    import inspect
+    forward = getattr(getattr(model, "_orig_mod", model), "forward")
+    params = inspect.signature(forward).parameters
+    return name in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
 @torch.no_grad()
 def run_eval(model: UnifiedPerceptionModel, loader, cfg, device, score_threshold: float = 0.3, max_batches=None):
     """Evaluate; the model's streaming state is saved and restored around the pass."""
@@ -82,6 +90,12 @@ def _run_eval(model, loader, cfg, device, score_threshold, max_batches):
         stream_reset = batch.get("stream_reset")
         stream_pad = batch.get("stream_pad")
         extra = {} if stream_reset is None else {"stream_reset": stream_reset.to(device)}
+        host_valid = batch.get("camera_valid")
+        if isinstance(host_valid, torch.Tensor) and not host_valid.is_cuda and _accepts(model, "camera_valid_host"):
+            # Host copies: view selection without a device sync; native-aspect valid sizes.
+            extra["camera_valid_host"] = host_valid.bool()
+            if isinstance(batch.get("image_hw"), torch.Tensor):
+                extra["image_hw_host"] = batch["image_hw"]
         cls_scores, kpts_norm, _, _ = model(imgs, world2img, intrinsics, camera_valid=camera_valid, **extra)
         track_output = getattr(head, "track_output", None)
         track_ids = None if track_output is None else track_output["track_ids"]

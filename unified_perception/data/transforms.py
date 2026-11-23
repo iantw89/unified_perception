@@ -18,6 +18,13 @@ import torch.nn.functional as F
 _Array = Union[np.ndarray, torch.Tensor]
 
 
+def fit_long_side(height: int, width: int, long_side: int) -> Tuple[int, int]:
+    """(h, w) of a ``height`` x ``width`` image scaled so its longer side is ``long_side``
+    (aspect kept; ``resize_image_and_intrinsics`` to this size adds no padding)."""
+    s = long_side / max(height, width)
+    return int(round(height * s)), int(round(width * s))
+
+
 @overload
 def resize_image_and_intrinsics(image: torch.Tensor, K: np.ndarray, out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, np.ndarray]: ...
 

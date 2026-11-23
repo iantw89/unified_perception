@@ -23,6 +23,7 @@ import torch.nn as nn
 
 from ..config import Config
 from .backbones import BACKBONES, resolve_backbone, resolve_repo_path
+from .pose2d_aux import Pose2DHead, aux2d_loss
 from .vit_backbone import DinoV3SimpleFPNBackbone, fpn_levels_for
 from .reid import ExternalReID
 from .sparse_head import SparseHead
@@ -39,6 +40,16 @@ def _host_index(mask_host: Optional[torch.Tensor], device) -> Optional[torch.Ten
     if torch.device(device).type == "cuda":
         return index.pin_memory().to(device, non_blocking=True)
     return index.to(device)
+
+def _active_rows(image_hw_host: Optional[torch.Tensor], mask_host: Optional[torch.Tensor],
+                 T: int) -> Optional[torch.Tensor]:
+    """(B, N, 2) per-camera valid image sizes -> one (h, w) per backbone image, in the (B, T, N)
+    flattening order of the window's active views (``mask_host`` (B, T, N); all views if None)."""
+    if image_hw_host is None:
+        return None
+    rows = image_hw_host[:, None].expand(-1, T, -1, -1).reshape(-1, 2)
+    return rows if mask_host is None else rows[mask_host.reshape(-1).bool()]
+
 
 class UnifiedPerceptionModel(nn.Module):
     def __init__(self, cfg: Config):
@@ -69,6 +80,8 @@ class UnifiedPerceptionModel(nn.Module):
                 feature_indices=feature_indices,
                 trainable=m.yolo_trainable,
             )
+        # Native-aspect canvases: the backbone runs only each image's valid region (ViT backbones).
+        self.crop_to_valid = bool(getattr(self.backbone, "accepts_valid_hw", False))
         # Probe per-level channel counts and build 1×1 linear projections
         # to unify all scales to embed_dims.
         with torch.no_grad():
@@ -84,6 +97,11 @@ class UnifiedPerceptionModel(nn.Module):
         )
 
         # Per-camera learnable embedding (helps disambiguate views).
+        # Auxiliary 2-D pose heatmaps on the finest (stride-8) level (experimental; training only).
+        self.aux2d = (Pose2DHead(feat_channels[0], m.num_joints, m.aux2d_hidden) if m.aux2d_weight > 0 else None)
+        self.aux2d_output: Optional[dict] = None
+        self._aux_feat: Optional[torch.Tensor] = None
+
         self.cam_embed = nn.Parameter(torch.zeros(cfg.data.num_cameras, self.embed_dims))
         nn.init.trunc_normal_(self.cam_embed, std=0.02)
 
@@ -123,7 +141,7 @@ class UnifiedPerceptionModel(nn.Module):
 
     # ------------------------------------------------------------------ #
     def _run_backbone(self, flat_images: torch.Tensor, active: Optional[torch.Tensor],
-                      return_detections: bool = False):
+                      return_detections: bool = False, crop_rows: Optional[torch.Tensor] = None):
         """Backbone features of (M, 3, H, W) images, zero for inactive (padded) views."""
         # Exclude padding from the backbone, including trainable BatchNorm statistics.
         # uint8 images are normalized chunk by chunk inside the backbone call (a float32
@@ -136,8 +154,9 @@ class UnifiedPerceptionModel(nn.Module):
         images = flat_images if index is None else flat_images.index_select(0, index)
         mean, std = self.input_mean.view(1, 3, 1, 1), self.input_std.view(1, 3, 1, 1)
         if getattr(self.backbone, "normalizes_uint8", False):
+            crop = {"valid_hw": crop_rows} if crop_rows is not None and getattr(self, "crop_to_valid", False) else {}
             feats_list, dets = self.backbone(images, return_detections=return_detections,
-                                             input_mean=mean, input_std=std)
+                                             input_mean=mean, input_std=std, **crop)
         else:  # other backbones (e.g. test stubs) take normalized float images
             if images.dtype == torch.uint8:
                 images = (images.float() - mean) / std
@@ -158,6 +177,7 @@ class UnifiedPerceptionModel(nn.Module):
         return_detections: bool = False,
         camera_valid: Optional[torch.Tensor] = None,
         active_index: Optional[torch.Tensor] = None,  # long index of active views (host-built)
+        crop_rows: Optional[torch.Tensor] = None,     # (active views, 2) host valid (h, w) sizes
     ):
         """Run the backbone and build per-token calibration codes.
 
@@ -177,7 +197,9 @@ class UnifiedPerceptionModel(nn.Module):
 
         active = None if camera_valid is None else camera_valid.reshape(-1)
         feats_list, dets_flat = self._run_backbone(
-            imgs_t.reshape(B * N, 3, H, W), active if active_index is None else active_index, return_detections)
+            imgs_t.reshape(B * N, 3, H, W), active if active_index is None else active_index, return_detections, crop_rows)
+        if self.aux2d is not None and self.training:
+            self._aux_feat = feats_list[0]          # (B*N, C, H/8, W/8), zero for inactive views
         if active is not None:
             if return_detections and dets_flat is not None:   # (ViT backbones report none)
                 detections = iter(dets_flat)
@@ -239,6 +261,7 @@ class UnifiedPerceptionModel(nn.Module):
         track_targets:      Optional[dict] = None,
         stream_reset:       Optional[torch.Tensor] = None,  # (B,) bool
         camera_valid_host:  Optional[torch.Tensor] = None,  # CPU copy of camera_valid (no device sync)
+        image_hw_host:     Optional[torch.Tensor] = None,  # (B, N, 2) CPU valid image sizes (data/collate.py)
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict], Optional[list]]:
         """Forward pass over a temporal window.
 
@@ -303,6 +326,9 @@ class UnifiedPerceptionModel(nn.Module):
                 None if intrinsics is None else intrinsics.reshape(B * T, N, 4, 4),
                 camera_valid=None if camera_valid is None else camera_valid.reshape(B * T, N),
                 active_index=_host_index(camera_valid_host, imgs.device),
+                # (rows must follow the host-indexed view selection; none with a device-only mask)
+                crop_rows=(_active_rows(image_hw_host, camera_valid_host, T)
+                           if camera_valid is None or camera_valid_host is not None else None),
             )
             feats = ft.view(B, T, *ft.shape[1:])   # (B, T, N*sum_L, C)
             mlns = mt.view(B, T, *mt.shape[1:])    # (B, T, N*sum_L, 14)
@@ -315,6 +341,18 @@ class UnifiedPerceptionModel(nn.Module):
             track_targets=track_targets,
             stream_reset=stream_reset,
         )
+        self.aux2d_output = None
+        if self.aux2d is not None and self.training and track_targets is not None and self._aux_feat is not None:
+            loss, num_pos = aux2d_loss(
+                self.aux2d, self._aux_feat, 8, self.cfg.model.aux2d_sigma_cells,
+                gt_mm=self.denormalize_keypoints(track_targets["gt"]),
+                keypoint_valid=track_targets["keypoint_valid"], frame_valid=track_targets["frame_valid"],
+                world2img=world2img, camera_valid=camera_valid,
+                image_hw=None if image_hw_host is None else image_hw_host.to(imgs.device, non_blocking=True),
+                image_size=(H, W), sigma_mm=track_targets.get("sigma_mm"),
+                kp2d=track_targets.get("kp2d"), kp2d_valid=track_targets.get("kp2d_valid"))
+            self.aux2d_output = {"loss": loss, "num_pos": num_pos}
+        self._aux_feat = None
         return cls_scores, kpts_norm, dn_meta, dets_2d if return_2d else None
 
     # ------------------------------------------------------------------ #

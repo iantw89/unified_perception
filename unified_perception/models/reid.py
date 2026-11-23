@@ -328,6 +328,10 @@ def person_crop_boxes(keypoints_mm: torch.Tensor, world2img: torch.Tensor, image
     boxes = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
     count = inside.sum(-1)
     weight = torch.where(count >= min_joints, count.float(), torch.zeros_like(count, dtype=torch.float))
+    # Views with no joint inside have infinite extents; give them a finite placeholder box so a
+    # fixed crop budget (ExternalReID.max_crops) that samples them still gets finite pixels.
+    placeholder = torch.tensor([0.0, 0.0, 1.0, 1.0], device=boxes.device, dtype=boxes.dtype)
+    boxes = torch.where((weight > 0)[..., None] & torch.isfinite(boxes).all(-1, keepdim=True), boxes, placeholder)
     return boxes, weight
 
 
@@ -393,7 +397,8 @@ class ExternalReID(nn.Module):
             embeds = torch.cat([self.net(crops[i:i + self.chunk].to(dtype))
                                 for i in range(0, len(crops), self.chunk)])
         w = weight[b, q, n][:, None]
-        out.index_put_((b, q), embeds.float() * w, accumulate=True)   # dropped / unused crops: w = 0
+        # Dropped / unused crops (w = 0) contribute nothing, even if their embedding is not finite.
+        out.index_put_((b, q), torch.where(w > 0, embeds.float() * w, 0.0), accumulate=True)
         if keep is not None:   # views beyond the budget do not count towards the normalization
             kept = torch.zeros_like(weight).index_put_((b, q, n), keep.to(weight.dtype))
             weight = weight * kept

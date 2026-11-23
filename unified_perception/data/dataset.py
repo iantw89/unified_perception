@@ -109,4 +109,6 @@ class MultiViewPoseDataset(Dataset):
             out["frame_ids"] = torch.from_numpy(raw["frame_ids"])
         if "camera_ids" in raw:
             out["camera_ids"] = raw["camera_ids"]
+        if "image_hw" in raw:
+            out["image_hw"] = torch.as_tensor(raw["image_hw"], dtype=torch.long)
         return _with_sparse_targets(out)

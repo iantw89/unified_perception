@@ -33,6 +33,12 @@ class DataConfig:
     provider: str = "human_prior_aligned"
     image_height: int = 256
     image_width: int = 256
+    # Native-aspect images (0 = off: every source letterboxed into image_height x image_width).
+    # When set, each camera is scaled so its longer side is this many pixels, without padding, and
+    # placed at the top-left of the batch canvas (data/collate.py), which is rounded up to the
+    # coarsest FPN stride (32 below 1024 px, else 64); samples carry each camera's valid ``image_hw`` and the ViT backbone runs
+    # only that region.  Gym 640 -> 480 x 640, MOYO 468 x 640 (or portrait), mocap 640 x 640.
+    image_long_side: int = 0
     # Number of camera views per frame.
     num_cameras: int = 4
     # Treat num_cameras as a ceiling; collate masks padding for mixed-view batches.
@@ -91,6 +97,9 @@ class DataConfig:
     # Serve the *training* aligned windows through the same cache (folder per split).  Misses
     # decode from the source and fill the cache; prebuild with cache_eval_windows --split train.
     train_window_cache: bool = False
+    # Cache misses are errors instead of decoding the source (machines without the source videos,
+    # e.g. a cloud pod with only the prebuilt caches).
+    window_cache_required: bool = False
 
     # --- Shuffle buffer (IterableDataset mode) ---
     # When True, use ShuffleBufferDataset instead of MultiViewPoseDataset.
@@ -179,6 +188,11 @@ class ModelConfig:
     # (models/vit_backbone.py: fpn_levels_for): 3 at 640 px (a 10 x 10 stride-64 map is too coarse
     # to help), 4 from 1024 px (e.g. 1280 px: 20 x 20, needed for large people).
     vit_fpn_levels: int = 0
+    # Auxiliary 2-D pose heatmaps on the stride-8 level (models/pose2d_aux.py; experimental).
+    # 0 = off.  Supervised with projected 3-D GT + gym 2-D-only targets on labelled frames.
+    aux2d_weight: float = 0.0
+    aux2d_sigma_cells: float = 1.0
+    aux2d_hidden: int = 128
 
     # --- 3D position encoder ---
     depth_num: int = 64

@@ -301,7 +301,8 @@ def aligned_component(cfg, split: str, fraction: float = 1.0, cache: bool = Fals
     groups = chained_windows(base.samples, cfg.data.seq_len)
     load = _IndexedWindow(base, base.samples, aligned=True)
     if cache and cfg.data.eval_window_cache:
-        load = CachedWindows(load, eval_cache_root(cfg, "aligned", split))
+        load = CachedWindows(load, eval_cache_root(cfg, "aligned", split),
+                             required=cfg.data.window_cache_required)
     return StreamComponent("aligned", groups, load, fraction)
 
 
@@ -315,9 +316,9 @@ class CachedWindows:
     atomically, so concurrent DataLoader workers and interrupted runs are safe.
     """
 
-    def __init__(self, load: Callable, root, quality: int = 95):
+    def __init__(self, load: Callable, root, quality: int = 95, required: bool = False):
         from pathlib import Path
-        self.load, self.root, self.quality = load, Path(root), quality
+        self.load, self.root, self.quality, self.required = load, Path(root), quality, required
 
     def path(self, key):
         import hashlib
@@ -337,6 +338,9 @@ class CachedWindows:
                 sample = data["sample"]
                 sample["imgs"] = torch.stack(decode_jpeg(data["jpeg"])).view(data["shape"])
                 return sample
+        if self.required:
+            raise FileNotFoundError(f"Window {key!r} is not in the cache {self.root} "
+                                    "(data.window_cache_required: prebuild it with cache_eval_windows)")
         sample = self.load(key)
         imgs = sample["imgs"]
         jpeg = [encode_jpeg(image, quality=self.quality) for image in imgs.reshape(-1, *imgs.shape[-3:])]
@@ -360,6 +364,12 @@ def eval_cache_root(cfg, name: str, split: str):
             "image_hw": [d.image_height, d.image_width], "fps": d.human_prior_target_fps,
             "num_cameras": d.num_cameras, "max_people": d.max_people, "split_seed": d.split_seed,
             "val_fraction": d.val_fraction, "stride": d.stride, "format": 1}
+    if d.image_long_side:
+        # Native-aspect caches: keyed by the long side and the source folder *names*, so the same
+        # cache resolves on another machine (e.g. a cloud pod) whatever the mount points are.
+        from pathlib import PureWindowsPath
+        spec.update(dirs=[PureWindowsPath(p).name for p in d.gym_mix_aligned_dirs],
+                    image_hw=["long_side", d.image_long_side], format=2)
     digest = hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
     root = Path(d.eval_window_cache) / f"{name}_{split}_{digest}"
     root.mkdir(parents=True, exist_ok=True)

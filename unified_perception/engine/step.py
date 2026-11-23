@@ -123,6 +123,12 @@ class TrainStep:
             if self.camera_valid_host is None and not self.camera_valid.is_cuda:
                 self.camera_valid_host = self.camera_valid.bool()
             self.camera_valid = self.camera_valid.to(device=d, dtype=torch.bool)
+        # Host copy of the per-camera valid image sizes (native-aspect canvases, data/collate.py):
+        # the ViT backbone runs each size group on its own region, decided on the host.
+        self.image_hw_host = batch.get("image_hw_host")
+        image_hw = batch.get("image_hw")
+        if self.image_hw_host is None and isinstance(image_hw, torch.Tensor) and not image_hw.is_cuda:
+            self.image_hw_host = image_hw
         self.gt_mm      = batch["gt_keypoints"].to(d)
         self.gt_valid   = batch["gt_valid"].to(d)
         self.gt_frame_valid = batch.get(
@@ -199,6 +205,7 @@ class TrainStep:
                 },
                 stream_reset=self.stream_reset,
                 camera_valid_host=self.camera_valid_host,
+                image_hw_host=self.image_hw_host,
             )
 
     def _extras(self) -> dict:
@@ -211,26 +218,7 @@ class TrainStep:
 
     def compute_loss(self) -> float:
         """Compute criterion loss; return scalar value (may be non-finite)."""
-        self.loss, self.metrics = self.criterion(
-            self.cls_scores.float(),
-            self.kpts_norm.float(),
-            self.gt_norm,
-            self.gt_valid,
-            self.dn_meta,
-            gt_keypoint_frame_valid=self.gt_frame_valid,
-            gt_root=self.gt_root_norm,
-            gt_root_valid=self.gt_root_valid,
-            gt_keypoint_valid=self.gt_keypoint_valid,
-            track_output=_head(self.model).track_output,
-            gt_keypoint_sigma=self.gt_sigma,
-            gt_root_sigma=self.gt_root_sigma,
-            gt_kp2d=self.gt_kp2d,
-            gt_kp2d_valid=self.gt_kp2d_valid,
-            world2img=self.world2img,
-            position_range=getattr(self.model, "_orig_mod", self.model).position_range,
-            gt_match_root=self.gt_match_root,
-            gt_match_root_valid=self.gt_match_root_valid,
-        )
+        self.loss, self.metrics = self._criterion_outputs()
         self.loss_val = self.loss.item()
         return self.loss_val
 
@@ -274,6 +262,18 @@ class TrainStep:
         return PendingStep(values, host)
 
     def _criterion_outputs(self):
+        return self._with_aux2d(*self._criterion_main())
+
+    def _with_aux2d(self, loss, metrics):
+        """Add the auxiliary 2-D pose loss (models/pose2d_aux.py) when the model produced one."""
+        aux = getattr(getattr(self.model, "_orig_mod", self.model), "aux2d_output", None)
+        if aux is None:
+            return loss, metrics
+        weight = getattr(self.model, "_orig_mod", self.model).cfg.model.aux2d_weight
+        metrics = dict(metrics, loss_aux2d=aux["loss"].detach(), num_aux2d_peaks=aux["num_pos"])
+        return loss + weight * aux["loss"], metrics
+
+    def _criterion_main(self):
         return self.criterion(
             self.cls_scores.float(),
             self.kpts_norm.float(),
@@ -304,7 +304,7 @@ class TrainStep:
         self.gt_sigma = self.gt_root_sigma = self.gt_kp2d = self.gt_kp2d_valid = None
         self.gt_match_root = self.gt_match_root_valid = None
         self.imgs       = self.world2img  = self.intrinsics = None
-        self.camera_valid = self.camera_valid_host = None
+        self.camera_valid = self.camera_valid_host = self.image_hw_host = None
         self.gt_mm      = self.gt_valid   = self.gt_norm    = None
         self.gt_frame_valid = self.gt_keypoint_valid = None
         self.gt_root = self.gt_root_valid = self.gt_root_norm = None
@@ -375,6 +375,8 @@ def _h2d_async(batch: dict, device: torch.device) -> dict:
     }
     if isinstance(batch.get("camera_valid"), torch.Tensor) and not batch["camera_valid"].is_cuda:
         out["camera_valid_host"] = batch["camera_valid"].bool()
+    if isinstance(batch.get("image_hw"), torch.Tensor) and not batch["image_hw"].is_cuda:
+        out["image_hw_host"] = batch["image_hw"]
     return out
 
 

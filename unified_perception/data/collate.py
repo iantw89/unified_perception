@@ -7,6 +7,39 @@ import torch
 from ..constants import ROOT_JOINTS, ROOT_SLICE
 
 
+def _canvas_multiple(long_side: int) -> int:
+    """Canvas granularity: the coarsest SimpleFPN stride (32 below 1024 px, else 64), so every
+    feature level tiles the canvas exactly (models/vit_backbone.py: fpn_levels_for)."""
+    return 64 if long_side >= 1024 else 32
+
+
+def place_on_canvas(samples) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Native-aspect batches: (imgs (B, T, N, 3, Hc, Wc), image_hw (B, N, 2)) with every camera at
+    the top-left of a shared canvas rounded up to the FPN stride, or None when all samples are
+    same-size full frames (legacy fixed-size data).  Cameras keep their intrinsics (top-left
+    placement adds no offset); missing cameras report 0 x 0."""
+    sizes = {tuple(s["imgs"].shape[-2:]) for s in samples}
+    if len(sizes) == 1 and not any("image_hw" in s for s in samples):
+        return None
+    cameras = max(s["imgs"].shape[1] for s in samples)
+    hw = torch.zeros(len(samples), cameras, 2, dtype=torch.long)
+    for b, s in enumerate(samples):
+        n = s["imgs"].shape[1]
+        hw[b, :n] = (_tensor(s["image_hw"], dtype=torch.long) if "image_hw" in s
+                     else torch.tensor(s["imgs"].shape[-2:]).expand(n, 2))
+    long_side = int(max(max(size) for size in sizes))
+    m = _canvas_multiple(long_side)
+    Hc = -(-int(hw[..., 0].max()) // m) * m
+    Wc = -(-int(hw[..., 1].max()) // m) * m
+    first = samples[0]["imgs"]
+    imgs = torch.zeros(len(samples), first.shape[0], cameras, 3, Hc, Wc, dtype=first.dtype)
+    for b, s in enumerate(samples):
+        x = _tensor(s["imgs"])
+        h, w = min(x.shape[-2], Hc), min(x.shape[-1], Wc)
+        imgs[b, :, :x.shape[1], :, :h, :w] = x[..., :h, :w]
+    return imgs, hw
+
+
 def _tensor(value, *, dtype=None):
     return value if isinstance(value, torch.Tensor) and dtype is None else torch.as_tensor(value, dtype=dtype)
 
@@ -28,7 +61,11 @@ def collate_batch(samples):
             padding[:] = torch.eye(4, dtype=tensor.dtype, device=tensor.device)
         return torch.cat((tensor, padding), dim=1)
 
+    canvas = place_on_canvas(samples)
     for key in ("imgs", "world2img", "intrinsics"):
+        if key == "imgs" and canvas is not None:
+            out["imgs"], out["image_hw"] = canvas
+            continue
         out[key] = torch.stack([
             pad_cameras(sample[key], calibration=key != "imgs") for sample in samples
         ])

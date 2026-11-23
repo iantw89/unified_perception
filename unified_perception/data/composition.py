@@ -101,14 +101,47 @@ def _asset_path(root: Path, relative: str) -> Path:
     return path
 
 
+#: Compact siblings of the NPY pixel caches (tools/compact_composition_cache.py): RGB frames as
+#: JPEG (quality 95) and binary masks bit-packed.  ~15x / 8x smaller; preferred when present, so a
+#: machine holding only the compact files (e.g. a cloud pod) trains from them.
+JPEG_SUFFIX, BITS_SUFFIX = ".jpg.pt", ".bits.npz"
+
+
+def compact_path(npy_path: Path) -> Path:
+    """Compact sibling of a ``-imgs.npy`` (JPEG) or ``-masks.npy`` (bit-packed) cache file."""
+    return npy_path.with_name(npy_path.stem + (BITS_SUFFIX if npy_path.stem.endswith("-masks") else JPEG_SUFFIX))
+
+
+def load_pixels(path: Path) -> np.ndarray:
+    """An NPY pixel cache (uint8 RGB (..., 3, H, W) or bool masks) from its compact sibling when
+    one exists, else memory-mapped from the NPY itself."""
+    compact = compact_path(path)
+    if compact.exists():
+        if compact.name.endswith(BITS_SUFFIX):
+            with np.load(compact, allow_pickle=False) as data:
+                shape = tuple(int(v) for v in data["shape"])
+                return np.unpackbits(data["packed"], axis=-1, count=shape[-1]).reshape(shape).astype(data["dtype"].item())
+        import torch
+        from torchvision.io import decode_jpeg
+        packet = torch.load(compact, weights_only=True)
+        frames = torch.stack(decode_jpeg(packet["jpeg"]))
+        return frames.view(*packet["shape"]).numpy()
+    return np.load(path, mmap_mode="r", allow_pickle=False)
+
+
 def verify_clip_assets(root: Path, entry: dict[str, Any], *, full_hash: bool = False) -> None:
     assets = entry.get("assets", [dict(path=entry["path"], sha256=entry["sha256"])])
     for asset in assets:
         path = _asset_path(root, asset["path"])
+        if not path.exists() and path.suffix == ".npy" and compact_path(path).exists():
+            continue        # shipped as its compact sibling only (integrity: the bundle manifest)
         stat = path.stat()
-        if "size" in asset and (stat.st_size != asset["size"] or stat.st_mtime_ns != asset["mtime_ns"]):
+        if "size" in asset and stat.st_size != asset["size"]:
             raise ValueError(f"Stale or modified cache: {path}")
-        if (full_hash or "size" not in asset) and file_hash(path) != asset["sha256"]:
+        # A copied cache (e.g. extracted on another machine) keeps sizes but not always mtimes:
+        # then the content hash decides.
+        moved = "size" in asset and stat.st_mtime_ns != asset["mtime_ns"]
+        if (full_hash or moved or "size" not in asset) and file_hash(path) != asset["sha256"]:
             raise ValueError(f"Stale or modified cache: {path}")
 
 
@@ -145,8 +178,8 @@ def load_clip(root: Path, entry: dict[str, Any], verify_hash: bool = True) -> Cl
         verify_clip_assets(root, entry, full_hash=True)
     with np.load(path, allow_pickle=False) as data:
         if entry.get("storage") == "npy":
-            imgs = np.load(_asset_path(root, entry["imgs_path"]), mmap_mode="r", allow_pickle=False)
-            masks = np.load(_asset_path(root, entry["masks_path"]), mmap_mode="r", allow_pickle=False)
+            imgs = load_pixels(_asset_path(root, entry["imgs_path"]))
+            masks = load_pixels(_asset_path(root, entry["masks_path"]))
         else:
             imgs, masks = data["imgs"], data["masks"]
         clip = Clip(entry, imgs, masks, data["joints"], data["world2img"], data["intrinsics"])
@@ -497,7 +530,7 @@ class CompositionDataset(Dataset):
             identity = source["id"]
         if expected_order is not None and "pixel_cache" in recipe:
             cached = recipe["pixel_cache"]
-            imgs = np.load(_asset_path(self.root, cached["imgs_path"]), mmap_mode="r", allow_pickle=False).copy()
+            imgs = np.array(load_pixels(_asset_path(self.root, cached["imgs_path"])))
             with np.load(_asset_path(self.root, cached["path"]), allow_pickle=False) as packet:
                 joints = packet["joints"]
                 world2img, intrinsics = packet["world2img"], packet["intrinsics"]
@@ -520,7 +553,9 @@ class CompositionDataset(Dataset):
             raise ValueError("Non-finite cached recipe geometry")
         d = self.cfg.data
         valid_cameras = (1 <= n <= d.num_cameras if d.allow_fewer_cameras else n == d.num_cameras)
-        if (t, h, w) != (d.seq_len, d.image_height, d.image_width) or not valid_cameras:
+        size_ok = (max(h, w) == d.image_long_side if d.image_long_side
+                   else (h, w) == (d.image_height, d.image_width))
+        if t != d.seq_len or not size_ok or not valid_cameras:
             raise ValueError("Cache window/image/camera shape differs from config")
         gt = np.zeros((t, d.max_people, NUM_JOINTS, 3), dtype=np.float32)
         valid = np.zeros((t, d.max_people), dtype=bool)

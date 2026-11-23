@@ -22,7 +22,7 @@ from ..config import Config
 from ..constants import JOINT_INDEX, NUM_JOINTS, ROOT_JOINTS
 from .interface import DataProvider, SampleRef
 from .registry import register_provider
-from .transforms import resize_image_and_intrinsics
+from .transforms import fit_long_side, resize_image_and_intrinsics
 
 if TYPE_CHECKING:
     from torchcodec.decoders import VideoDecoder  # type: ignore[reportPrivateImportUsage]
@@ -91,6 +91,11 @@ class HumanPriorAlignedProvider(DataProvider):
         self.seq_len = cfg.data.seq_len
         self.num_cameras = cfg.data.num_cameras
         self.out_hw = (cfg.data.image_height, cfg.data.image_width)
+        # Native-aspect mode: each camera fits ``long_side`` without padding, top-left in an
+        # out_hw = long_side x long_side canvas, with its valid size reported as ``image_hw``.
+        self.long_side = int(getattr(cfg.data, "image_long_side", 0) or 0)
+        if getattr(self, "long_side", 0):
+            self.out_hw = (self.long_side, self.long_side)
         self.max_people = cfg.data.max_people
         self.mean = cfg.data.pixel_mean
         self.std = cfg.data.pixel_std
@@ -374,7 +379,9 @@ class HumanPriorAlignedProvider(DataProvider):
 
         def _prepare_img(frame_idx: int, cam_idx: int, K: np.ndarray) -> Tuple[torch.Tensor, np.ndarray]:
             rgb = images_rgb[cam_ids[cam_idx]][frame_idx]
-            rgb, K2 = resize_image_and_intrinsics(rgb, K, self.out_hw)
+            long_side = getattr(self, "long_side", 0)
+            size = fit_long_side(*rgb.shape[:2], long_side) if long_side else self.out_hw
+            rgb, K2 = resize_image_and_intrinsics(rgb, K, size)
             img = rgb.permute(2, 0, 1).contiguous()
             return img, K2
 
@@ -495,6 +502,8 @@ class HumanPriorAlignedProvider(DataProvider):
         np.random.shuffle(all_cam_ids)
 
         N = num_cameras
+        if getattr(self, "long_side", 0):
+            raise NotImplementedError("image_long_side is not supported by the shuffle-buffer path")
         H, W = self.out_hw
 
         decoders = {}
@@ -812,6 +821,7 @@ def _build_output_window(
     J = keypoints.shape[2]
 
     imgs = torch.zeros((T, N, 3, out_hw[0], out_hw[1]), dtype=torch.uint8)
+    image_hw = np.zeros((N, 2), dtype=np.int64)        # valid (top-left) size per camera
     world2img = np.zeros((T, N, 4, 4), dtype=np.float32)
     intrinsics = np.zeros((T, N, 4, 4), dtype=np.float32)
     gt_kpts = np.zeros((T, max_people, J, 3), dtype=np.float32)
@@ -825,7 +835,8 @@ def _build_output_window(
     for ti in range(T):
         for c in range(N):
             img, K2 = image_loader(ti, c, K_by_cam[c])
-            imgs[ti, c] = img
+            imgs[ti, c, :, :img.shape[1], :img.shape[2]] = img
+            image_hw[c] = img.shape[1:3]
 
             extr = np.eye(4, dtype=np.float64)
             extr[:3, :3] = R_by_cam[c]
@@ -854,6 +865,7 @@ def _build_output_window(
 
     return {
         "imgs": imgs,
+        "image_hw": image_hw,
         "world2img": world2img,
         "intrinsics": intrinsics,
         "gt_keypoints": gt_kpts,

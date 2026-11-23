@@ -93,3 +93,58 @@ def test_fpn_levels_follow_image_size():
     fpn = SimpleFPN(32, 8, fpn_levels_for(1280, 1280))
     shapes = [tuple(l.shape[-2:]) for l in fpn(torch.zeros(1, 32, 80, 80))]     # 1280 / 16 = 80
     assert shapes == [(160, 160), (80, 80), (40, 40), (20, 20)]
+
+
+def _sample(n, h, w, image_hw=None):
+    s = {"imgs": torch.full((2, n, 3, h, w), 7, dtype=torch.uint8)}
+    if image_hw is not None:
+        s["image_hw"] = torch.tensor(image_hw)
+    return s
+
+
+def test_canvas_placement_native_aspect():
+    """Mixed native sizes share a top-left canvas rounded to stride 32; MOYO-style samples padded
+    to a long-side square shrink to the batch's largest valid size; legacy batches are untouched."""
+    from unified_perception.data.collate import place_on_canvas
+    gym = _sample(2, 480, 640)
+    moyo = _sample(2, 640, 640, [[468, 640], [640, 468]])
+    imgs, hw = place_on_canvas([gym, moyo])
+    assert imgs.shape == (2, 2, 2, 3, 640, 640)
+    assert hw.tolist() == [[[480, 640], [480, 640]], [[468, 640], [640, 468]]]
+    assert imgs[0, :, :, :, 480:].abs().sum() == 0            # gym below its valid rows: padding
+    landscape = _sample(1, 640, 640, [[468, 640]])
+    imgs, hw = place_on_canvas([gym, landscape])
+    assert imgs.shape[-2:] == (480, 640) and hw[1, 1].tolist() == [0, 0]   # missing camera
+    assert place_on_canvas([_sample(2, 640, 640), _sample(2, 640, 640)]) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="bf16 trunk test uses CUDA")
+def test_valid_region_groups_and_padding():
+    """Images are grouped by valid size (rounded up to stride 32) and returned in input order; an
+    image's levels equal the region-only run zero-padded bottom / right onto the canvas grid."""
+    torch.manual_seed(0)
+    bb = DinoV3SimpleFPNBackbone(None).cuda().eval()
+    imgs = torch.randint(0, 255, (5, 3, 640, 640), dtype=torch.uint8, device="cuda")
+    hw = torch.tensor([[480, 640], [640, 640], [468, 640], [480, 640], [640, 468]])
+    for i, (h, w) in enumerate(hw.tolist()):
+        imgs[i, :, h:] = 0
+        imgs[i, :, :, w:] = 0
+    mean = torch.zeros(1, 3, 1, 1, device="cuda")
+    std = torch.full((1, 3, 1, 1), 255.0, device="cuda")
+    with torch.no_grad():
+        out, _ = bb(imgs, input_mean=mean, input_std=std, valid_hw=hw)
+        landscape = bb._levels(imgs[[0, 2, 3], :, :480], mean, std)    # 468 rounds up to 480
+        portrait = bb._levels(imgs[[4], :, :, :480], mean, std)
+        square = bb._levels(imgs[[1]], mean, std)
+    assert [tuple(l.shape) for l in out] == [(5, 256, 80, 80), (5, 256, 40, 40), (5, 256, 20, 20)]
+    for level, a, p, q, s in zip(out, landscape, portrait, square, (8, 16, 32)):
+        k = 480 // s
+        assert torch.allclose(level[[0, 2, 3], :, :k], a, atol=1e-3)
+        assert level[[0, 2, 3], :, k:].abs().max() == 0
+        assert torch.allclose(level[[4], :, :, :k], p, atol=1e-3) and level[[4], :, :, k:].abs().max() == 0
+        assert torch.allclose(level[[1]], q, atol=1e-3)
+
+
+def test_crop_alignment_follows_levels():
+    assert DinoV3SimpleFPNBackbone(None, fpn_levels=3).crop_alignment == 32
+    assert DinoV3SimpleFPNBackbone(None, fpn_levels=4).crop_alignment == 64

@@ -67,6 +67,7 @@ class GymPseudo3DProvider(DataProvider):
         self.root = Path(cfg.data.gym_pseudo3d_root)
         index = json.loads((self.root / "index.json").read_text(encoding="utf-8"))
         self.camera_ids = index["camera_ids"]
+        self.cache_hw = tuple(index["image_hw"])
         self.format_version = index.get("format_version", 1)
         self.image_pattern = index.get("image_pattern", "f{frame:03d}_c{camera:03d}.png")
         self.capture_group = index.get("dataset", GYM_CAPTURE_GROUP) if self.format_version >= 3 else GYM_CAPTURE_GROUP
@@ -148,6 +149,12 @@ class GymPseudo3DProvider(DataProvider):
         folder, poses, calib = self.sequences[name]
         cfg = self.cfg.data
         length, size = cfg.seq_len, (cfg.image_height, cfg.image_width)
+        if cfg.image_long_side:
+            # Native aspect: the cache must already be at the long side (no letterbox, no resize).
+            if max(self.cache_hw) != cfg.image_long_side:
+                raise ValueError(f"Gym cache is {self.cache_hw}; image_long_side={cfg.image_long_side} "
+                                 "needs a cache imported at that size (tools/import_golden.py --size)")
+            size = self.cache_hw
         stop = start + length
         if start < 0 or stop > len(poses["frames"]):
             raise ValueError("Window extends past a split boundary")
