@@ -48,7 +48,7 @@ from typing import Optional
 
 import torch
 
-from ..constants import ROOT_JOINTS
+from ..constants import ROOT_JOINTS, ROOT_SLICE
 from .matcher import hungarian_match, to_device
 from .supervision import Supervision, match, match_many
 
@@ -104,7 +104,7 @@ class TrackState:
 
 
 def root_of(kpts: torch.Tensor) -> torch.Tensor:
-    return kpts[..., list(ROOT_JOINTS), :].mean(dim=-2)
+    return kpts[..., ROOT_SLICE, :].mean(dim=-2)
 
 
 class TrackManager:
@@ -134,6 +134,7 @@ class TrackManager:
         pr = torch.as_tensor(position_range, dtype=torch.float32)
         self.range_min, self.range_size = pr[:3], pr[3:] - pr[:3]
         self.position_range = pr
+        self.gpu_assignment = bool(getattr(m, "gpu_assignment", False))
 
     # ------------------------------------------------------------------ #
     def match_detections(self, logits, preds, gts, roots, roots_valid, joints_valid, supervised: bool):
@@ -190,6 +191,10 @@ class TrackManager:
         come back in one transfer, and the next state is written with a few batched index
         operations: the per-frame loop never waits on the device otherwise.
         """
+        if self.gpu_assignment:
+            from . import gpu_assignment
+            return gpu_assignment.train_step(self, state, num_det, cls, kpts, feat, targets, t,
+                                             codes=codes, ema=ema, app=app)
         B, Qm = cls.shape[:2]
         K = Qm - num_det
         device = cls.device

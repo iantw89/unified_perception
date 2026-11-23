@@ -6,9 +6,9 @@ import torch
 import torch.nn.functional as F
 
 from torchvision.ops import sigmoid_focal_loss
-from ..constants import ROOT_JOINTS
+from ..constants import ROOT_JOINTS, ROOT_SLICE
 from .matcher import hungarian_match
-from .reid import ReIDLoss
+from .reid import DeviceReIDLoss, ReIDLoss
 from .matcher import to_device
 from .supervision import LossSettings, Supervision, batch_pair_losses, match, pair_losses
 
@@ -34,10 +34,12 @@ class SetCriterion(torch.nn.Module):
         self.costs = {"class": m.cost_class, "kpt": m.cost_kpt, "alpha": m.focal_alpha, "gamma": m.focal_gamma,
                       "root": self.cost_root, "root_labeled": self.cost_root_labeled}
         self.reid_weight = getattr(m, "reid_loss_weight", 0.0)
-        self.reid = None
+        self.reid = self.reid_device = None
         if getattr(m, "reid_dims", 0) and getattr(m, "track_queries", False):
             self.reid = ReIDLoss(m.reid_temperature, m.reid_bank_recent, m.reid_bank_anchors,
                                  m.reid_bank_stride)
+            self.reid_device = DeviceReIDLoss(m.reid_temperature, m.reid_bank_recent, m.reid_bank_anchors,
+                                              m.reid_bank_stride)
 
     def forward(
         self,
@@ -87,7 +89,7 @@ class SetCriterion(torch.nn.Module):
             & gt_keypoint_frame_valid[:, :, None, None]
         )
         if gt_root is None:
-            gt_root = gt_keypoints[..., list(ROOT_JOINTS), :].mean(dim=-2)
+            gt_root = gt_keypoints[..., ROOT_SLICE, :].mean(dim=-2)
         if gt_root_valid is None:
             gt_root_valid = gt_valid
         gt_root_valid = gt_root_valid.to(device=device, dtype=torch.bool) & gt_valid
@@ -103,6 +105,9 @@ class SetCriterion(torch.nn.Module):
         counts = {key: 0 for key in ("pos", "kpt", "root", "reproj")}
         assignments = None if track_output is None else track_output.get("assignments")
         num_track_pairs = 0
+        if isinstance(assignments, dict):   # model.gpu_assignment: tensors, no host round trips
+            return self._device_forward(sup, cls_scores, keypoints, track_output, dn_meta,
+                                        gt_keypoint_frame_valid)
         if assignments is not None and self.share_aux_matching:
             num_track_pairs = self._shared_track_loss(sup, cls_scores, keypoints, assignments, sums, counts)
         for lvl in range(L if not (assignments is not None and self.share_aux_matching) else 0):
@@ -174,6 +179,79 @@ class SetCriterion(torch.nn.Module):
             del metrics["loss_reproj"], metrics["num_reproj"]
         metrics.update(extra)
         return total, metrics
+
+    def _device_forward(self, sup, cls_scores, keypoints, out, dn_meta, gt_keypoint_frame_valid):
+        """Track-mode loss from tensor assignments (``model.gpu_assignment``), fully on the device.
+
+        Same terms as the shared-matching path (:meth:`_shared_track_loss` + :meth:`_reid_loss`):
+        the final layer's assignment applies to every decoder layer, ignored / invalid slots get
+        no class loss.  Pairs are evaluated densely over every (lane, frame, query) with a mask
+        instead of gathering a variable-length list, and all metrics stay tensors.
+        """
+        if not self.share_aux_matching:
+            raise ValueError("model.gpu_assignment requires loss.share_aux_matching")
+        L, B, T, Q, _ = cls_scores.shape
+        device = cls_scores.device
+        target, excluded = out["assignments"]["target"], out["assignments"]["excluded"]   # (B, T, Q)
+        matched = target >= 0
+        focal = sigmoid_focal_loss(cls_scores[..., 0], matched.to(cls_scores.dtype).expand(L, B, T, Q),
+                                   self.alpha, self.gamma, reduction="none")
+        loss_sum_cls = (focal * (~excluded).to(focal.dtype)).sum()
+        b, t, q = (x.reshape(-1) for x in torch.meshgrid(
+            torch.arange(B, device=device), torch.arange(T, device=device), torch.arange(Q, device=device),
+            indexing="ij"))
+        terms = batch_pair_losses(sup, keypoints, b, t, q, target.clamp(min=0).reshape(-1), self.settings,
+                                  pair_mask=matched.reshape(-1))
+        n_pos = sup.valid.sum()
+        loss_cls = self.w_class * loss_sum_cls / (n_pos.clamp(min=1) * L)
+        loss_kpt = self.w_kpt * terms["kpt"] / (terms["n_kpt"].clamp(min=1) * 3 * L)
+        loss_root = self.w_root * terms["root"] / (terms["n_root"].clamp(min=1) * 3 * L)
+        loss_reproj = self.settings.reproj_weight * terms["reproj"] / (terms["n_reproj"].clamp(min=1) * L)
+        total = loss_cls + loss_kpt + loss_root + loss_reproj
+        num_det = out["num_det"]
+        values = {"loss_cls": loss_cls, "loss_kpt": loss_kpt, "loss_root": loss_root,
+                  "num_pos": n_pos, "num_kpt": terms["n_kpt"], "num_root": terms["n_root"],
+                  "loss_reproj": loss_reproj, "num_reproj": terms["n_reproj"],
+                  "num_track_pairs": matched[..., num_det:].sum()}
+        if self.reid_device is not None and "id_codes" in out:
+            loss_reid, anchors = self._device_reid_loss(out, target)
+            values["num_reid_anchors"] = anchors
+            loss_reid = self.reid_weight * loss_reid
+            total = total + loss_reid
+            values["loss_reid"] = loss_reid
+        if dn_meta is not None:
+            dn_cls_loss, dn_kpt_loss = self._dn_loss(dn_meta, gt_keypoint_frame_valid)
+            total = total + dn_cls_loss + dn_kpt_loss
+            values["dn_loss_cls"], values["dn_loss_kpt"] = dn_cls_loss, dn_kpt_loss
+        values["loss"] = total
+        # Metrics stay on the device; TrainStep reads them back once per step (step.read_metrics).
+        return total, {k: v.detach() for k, v in values.items()}
+
+    def _device_reid_loss(self, out, target):
+        """Identity codes of every identity-matched query (per frame) and track slot (EMA), as a
+        dense masked entry list in the reference insertion order."""
+        codes, ema, ids = out["id_codes"], out["id_ema"], out["instance_ids"]      # (B,T,Qm,D) (B,T,K,D) (B,T,P)
+        num_det = out["num_det"]
+        B, T, Qm, D = codes.shape
+        K = Qm - num_det
+        device = codes.device
+        identity = torch.gather(ids.long(), 2, target.clamp(min=0))                 # (B, T, Qm)
+        ok = (target >= 0) & (identity >= 0)
+        frame_index = torch.arange(T, device=device)
+        # Query entries (frame order; within a frame tracks before detections), then slot EMA codes.
+        order = torch.cat([torch.arange(num_det, Qm, device=device), torch.arange(num_det, device=device)])
+        q_codes, q_ok, q_ids = codes[:, :, order], ok[:, :, order], identity[:, :, order]
+        s_codes, s_ok, s_ids = ema, ok[:, :, num_det:], identity[:, :, num_det:]
+        entries = torch.cat([q_codes.reshape(B, T * Qm, D), s_codes.reshape(B, T * K, D).to(codes.dtype)], 1)
+        labels = torch.cat([q_ids.reshape(B, -1), s_ids.reshape(B, -1)], 1)
+        mask = torch.cat([q_ok.reshape(B, -1), s_ok.reshape(B, -1)], 1)
+        frames = torch.cat([frame_index[:, None].expand(T, Qm).reshape(-1),
+                            frame_index[:, None].expand(T, K).reshape(-1)])
+        groups = [torch.cat([frames[:T * Qm] == f, torch.zeros(T * K, dtype=torch.bool, device=device)])
+                  for f in range(T)]
+        groups += [torch.cat([torch.zeros(T * Qm, dtype=torch.bool, device=device), frames[T * Qm:] == f])
+                   for f in range(T)]
+        return self.reid_device(entries, labels, frames.expand(B, -1), mask, groups, out.get("lane_reset"), T)
 
     def _shared_track_loss(self, sup, cls_scores, keypoints, assignments, sums, counts) -> int:
         """Track mode with shared matching: every (layer, lane, frame) at once.

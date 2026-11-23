@@ -265,14 +265,14 @@ class SparseHead(nn.Module):
         updated per-slot EMA: returns (app (B, K, E), app_valid (B, K))."""
         if images is None:
             raise ValueError("crop re-identification needs the input images")
-        if self._frames_seen % self.external_stride or not state.valid.any():
+        if self._frames_seen % self.external_stride:
             return state.app_ema.clone(), state.app_valid.clone()
         kpts = kpts_norm[:, self.num_query:]
         kpts_mm = kpts * (self.pc_range[3:] - self.pc_range[:3]) + self.pc_range[:3]
         frame = images[:, t].float()
         if images.dtype != torch.uint8:  # already normalized: back to RGB 0..255
             frame = frame * self.pixel_std + self.pixel_mean
-        now, ok = self.external_reid(frame, kpts_mm, world2img, camera_valid)
+        now, ok = self.external_reid(frame, kpts_mm, world2img, camera_valid, person_valid=state.valid)
         ok &= state.valid
         m = self.reid_ema
         blended = torch.nn.functional.normalize(m * state.app_ema + (1 - m) * now, dim=-1)
@@ -671,7 +671,12 @@ class SparseHead(nn.Module):
                 "num_det": self.num_query,
                 "slot_valid": torch.stack(slot_valid_frames, dim=1),     # (B, T, K)
                 "track_ids": torch.stack(track_id_frames, dim=1),        # (B, T, Qm), -1 = none
-                "assignments": assignments if train_tracks else None,    # [T][B] dicts
+                # [T][B] dicts (host path) or, with model.gpu_assignment, tensors
+                # {"target", "excluded"} (B, T, Qm).
+                "assignments": (None if not train_tracks else
+                                {k: torch.stack([a[k] for a in assignments], dim=1) for k in assignments[0]}
+                                if assignments and isinstance(assignments[0], dict) and "target" in assignments[0]
+                                else assignments),
                 "aliases": aliases,            # inference re-id takeovers: (lane, provisional, recovered)
                 "lane_reset": lane_reset,      # (B,) lanes whose state was reset by this call
             }

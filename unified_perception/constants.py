@@ -52,3 +52,7 @@ JOINT_COLORS = [
 # The "root" joint used as a person's reference point (mid-hip is derived from
 # left/right hip; we use left_hip index for simple per-query reference anchoring).
 ROOT_JOINTS = (JOINT_INDEX["left_hip"], JOINT_INDEX["right_hip"])
+# The root joints as a slice: indexing a GPU tensor with a Python list or tuple copies the
+# index from pageable host memory, which synchronizes the device; a slice does not.
+assert ROOT_JOINTS == tuple(range(min(ROOT_JOINTS), max(ROOT_JOINTS) + 1)), "root joints must be contiguous"
+ROOT_SLICE = slice(min(ROOT_JOINTS), max(ROOT_JOINTS) + 1)

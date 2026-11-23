@@ -12,7 +12,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ..constants import ROOT_JOINTS
+from ..constants import ROOT_JOINTS, ROOT_SLICE
 
 
 def _head(model: nn.Module):
@@ -116,7 +116,12 @@ class TrainStep:
         self.world2img  = batch["world2img"].to(d)
         self.intrinsics = batch["intrinsics"].to(d)
         self.camera_valid = batch.get("camera_valid")
+        # Host copy of the view mask: the backbone selects active views by an index built on the
+        # host instead of boolean-mask indexing on the device (a synchronization per step).
+        self.camera_valid_host = batch.get("camera_valid_host")
         if self.camera_valid is not None:
+            if self.camera_valid_host is None and not self.camera_valid.is_cuda:
+                self.camera_valid_host = self.camera_valid.bool()
             self.camera_valid = self.camera_valid.to(device=d, dtype=torch.bool)
         self.gt_mm      = batch["gt_keypoints"].to(d)
         self.gt_valid   = batch["gt_valid"].to(d)
@@ -160,7 +165,7 @@ class TrainStep:
         if self.gt_root is not None:
             self.gt_root_norm = self.model.normalize_keypoints(self.gt_root)
         else:
-            self.gt_root_norm = self.gt_norm[..., list(ROOT_JOINTS), :].mean(dim=-2)
+            self.gt_root_norm = self.gt_norm[..., ROOT_SLICE, :].mean(dim=-2)
         if self.gt_match_root is not None:
             self.gt_match_root = self.model.normalize_keypoints(self.gt_match_root)
 
@@ -181,7 +186,7 @@ class TrainStep:
                 # loss remains available from independent root targets.
                 self.gt_valid
                 & self.gt_frame_valid[:, :, None]
-                & self.gt_keypoint_valid[..., list(ROOT_JOINTS)].all(dim=-1),
+                & self.gt_keypoint_valid[..., ROOT_SLICE].all(dim=-1),
                 return_2d=return_2d,
                 gt_keypoint_valid=self.gt_keypoint_valid,
                 camera_valid=self.camera_valid,
@@ -193,6 +198,7 @@ class TrainStep:
                     **self._extras(),
                 },
                 stream_reset=self.stream_reset,
+                camera_valid_host=self.camera_valid_host,
             )
 
     def _extras(self) -> dict:
@@ -228,6 +234,67 @@ class TrainStep:
         self.loss_val = self.loss.item()
         return self.loss_val
 
+    # ── Deferred step (no host synchronization) ─────────────────────────────
+
+    def deferred_supported(self) -> bool:
+        """Deferred steps need a fused optimizer on CUDA (skip on device via ``found_inf``)."""
+        return (self._device.type == "cuda"
+                and all(g.get("fused", False) for g in self.optimizer.param_groups))
+
+    def step_deferred(self, grad_clip: float) -> "PendingStep":
+        """Loss, backward, clip and optimizer update without waiting for the device.
+
+        A non-finite loss or gradient norm sets the fused optimizer's ``found_inf`` flag, so the
+        update is skipped on the device (parameters, moments and step counts untouched) instead
+        of by a host-side check.  Loss, gradient norm, the skip flag and every tensor metric are
+        copied to pinned host memory behind an event; read them with :meth:`PendingStep.result`
+        after the next step is queued, when the copy has long completed.
+        """
+        self.loss, self.metrics = self._criterion_outputs()
+        self.free_inputs()
+        self.optimizer.zero_grad(set_to_none=True)
+        torch.cuda.reset_peak_memory_stats()   # allocator bookkeeping, no device sync
+        self.loss.backward()
+        norm = _grad_norm(self.model)
+        found_inf = (~torch.isfinite(self.loss.detach()) | ~torch.isfinite(norm)).float()
+        torch.nn.utils.clip_grads_with_norm_(
+            [p for p in self.model.parameters() if p.grad is not None], grad_clip, norm)
+        self.optimizer.found_inf = found_inf
+        try:
+            self.optimizer.step()
+        finally:
+            del self.optimizer.found_inf
+        values = {"loss": self.loss.detach(), "grad_norm": norm, "skipped": found_inf}
+        host = {}
+        for key, value in self.metrics.items():
+            if isinstance(value, torch.Tensor):
+                values.setdefault(key, value)
+            else:
+                host[key] = value
+        return PendingStep(values, host)
+
+    def _criterion_outputs(self):
+        return self.criterion(
+            self.cls_scores.float(),
+            self.kpts_norm.float(),
+            self.gt_norm,
+            self.gt_valid,
+            self.dn_meta,
+            gt_keypoint_frame_valid=self.gt_frame_valid,
+            gt_root=self.gt_root_norm,
+            gt_root_valid=self.gt_root_valid,
+            gt_keypoint_valid=self.gt_keypoint_valid,
+            track_output=_head(self.model).track_output,
+            gt_keypoint_sigma=self.gt_sigma,
+            gt_root_sigma=self.gt_root_sigma,
+            gt_kp2d=self.gt_kp2d,
+            gt_kp2d_valid=self.gt_kp2d_valid,
+            world2img=self.world2img,
+            position_range=getattr(self.model, "_orig_mod", self.model).position_range,
+            gt_match_root=self.gt_match_root,
+            gt_match_root_valid=self.gt_match_root_valid,
+        )
+
     def free_inputs(self) -> None:
         """Delete input tensors before backward to free VRAM early."""
         del self.imgs, self.world2img, self.intrinsics, self.gt_mm, self.gt_valid
@@ -237,7 +304,7 @@ class TrainStep:
         self.gt_sigma = self.gt_root_sigma = self.gt_kp2d = self.gt_kp2d_valid = None
         self.gt_match_root = self.gt_match_root_valid = None
         self.imgs       = self.world2img  = self.intrinsics = None
-        self.camera_valid = None
+        self.camera_valid = self.camera_valid_host = None
         self.gt_mm      = self.gt_valid   = self.gt_norm    = None
         self.gt_frame_valid = self.gt_keypoint_valid = None
         self.gt_root = self.gt_root_valid = self.gt_root_norm = None
@@ -264,6 +331,29 @@ class TrainStep:
         self.optimizer.step()
 
 
+class PendingStep:
+    """Scalars of a queued step, copied device -> pinned host behind an event."""
+
+    def __init__(self, values: dict, host: dict):
+        self.names = list(values)
+        stacked = torch.stack([v.detach().float().reshape(()) for v in values.values()])
+        self._buf = torch.empty(stacked.shape, dtype=torch.float32, pin_memory=True)
+        self._buf.copy_(stacked, non_blocking=True)
+        self._event = torch.cuda.Event()
+        self._event.record()
+        self._host = host
+        self._result: dict | None = None
+
+    def result(self) -> dict:
+        """Wait only for this step's copy (later queued work keeps running) and return floats."""
+        if self._result is None:
+            self._event.synchronize()
+            self._result = {**self._host, **dict(zip(self.names, self._buf.tolist()))}
+            for key in [k for k in self._result if k.startswith("num_")]:
+                self._result[key] = int(self._result[key])
+        return self._result
+
+
 # ---------------------------------------------------------------------------
 # CUDA prefetcher
 # ---------------------------------------------------------------------------
@@ -274,7 +364,7 @@ def _h2d_async(batch: dict, device: torch.device) -> dict:
     Called inside a secondary CUDA stream — callers must synchronise via a
     ``torch.cuda.Event`` before consuming the returned tensors.
     """
-    return {
+    out = {
         k: (v.to(
                 device=device,
                 dtype=None,  # images stay uint8; the model normalizes per frame
@@ -283,6 +373,9 @@ def _h2d_async(batch: dict, device: torch.device) -> dict:
             if isinstance(v, torch.Tensor) else v)
         for k, v in batch.items()
     }
+    if isinstance(batch.get("camera_valid"), torch.Tensor) and not batch["camera_valid"].is_cuda:
+        out["camera_valid_host"] = batch["camera_valid"].bool()
+    return out
 
 
 class CUDAPrefetcher:

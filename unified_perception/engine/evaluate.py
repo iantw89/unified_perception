@@ -9,7 +9,7 @@ from unified_perception.models.detector import UnifiedPerceptionModel
 
 from .._compat import get_tqdm
 from .metrics import IdentityAccumulator, MetricsAccumulator
-from ..constants import ROOT_JOINTS
+from ..constants import ROOT_JOINTS, ROOT_SLICE
 from ..models.supervision import project
 
 tqdm = get_tqdm()
@@ -59,7 +59,7 @@ def _run_eval(model, loader, cfg, device, score_threshold, max_batches):
         ).to(device=device, dtype=torch.bool)
         gt_root = batch.get("gt_root")
         if gt_root is None:
-            gt_root = gt_kpts[..., list(ROOT_JOINTS), :].mean(dim=-2)
+            gt_root = gt_kpts[..., ROOT_SLICE, :].mean(dim=-2)
         else:
             gt_root = gt_root.to(device)
         gt_root_valid = batch.get("gt_root_valid", gt_valid).to(device=device, dtype=torch.bool)
@@ -113,7 +113,7 @@ def _run_eval(model, loader, cfg, device, score_threshold, max_batches):
                 two_d_stats[1] += int(two_d.sum())
                 pred = kpts_mm[b, t][keep].cpu().numpy()
                 gt = gt_kpts[b, t][valid].cpu().numpy()
-                pred_root = kpts_mm[b, t][:, list(ROOT_JOINTS), :].mean(dim=-2)[keep].cpu().numpy()
+                pred_root = kpts_mm[b, t][:, ROOT_SLICE, :].mean(dim=-2)[keep].cpu().numpy()
                 roots = gt_root[b, t][valid].cpu().numpy()
                 root_valid = gt_root_valid[b, t][valid].cpu().numpy()
                 joint_valid = gt_keypoint_valid[b, t][valid].cpu().numpy()

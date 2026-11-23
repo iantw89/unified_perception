@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator, ScalarEvent
 
 from ..config import Config, load_config
-from ..constants import ROOT_JOINTS, SKELETON_EDGES
+from ..constants import ROOT_JOINTS, ROOT_SLICE, SKELETON_EDGES
 from ..data import MultiViewPoseDataset, collate_batch
 from ..data.gym_pseudo3d import GymPseudo3DDataset
 from ..engine.evaluate import run_eval
@@ -275,7 +275,7 @@ def render_clip(sample, scores, poses, cfg: Config, cameras, title: str, thresho
         pred = poses[t, scores[t] > threshold]
         associations = acc.update_frame(
             pred, gt, keypoints_supervised=supervised,
-            pred_root_mm=pred[:, list(ROOT_JOINTS)].mean(1),
+            pred_root_mm=pred[:, ROOT_SLICE].mean(1),
             gt_root_mm=roots, gt_root_valid=root_valid, gt_keypoint_valid=masks,
         )
         matches = dict(associations)

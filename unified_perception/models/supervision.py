@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from ..constants import ROOT_JOINTS
+from ..constants import ROOT_JOINTS, ROOT_SLICE
 from .matcher import hungarian_cost, solve_costs, to_device
 
 
@@ -131,7 +131,9 @@ class Supervision:
             if self.kp2d is not None:
                 raise ValueError("2-D supervision needs the position range")
         else:
-            pr = torch.as_tensor(pr, dtype=torch.float32, device=self.gt.device)
+            if not (isinstance(pr, torch.Tensor) and pr.device == self.gt.device):
+                pr = torch.as_tensor(pr, dtype=torch.float32).to(self.gt.device, non_blocking=True)
+            pr = pr.float()
             self.range_min, self.range_size = pr[:3], pr[3:] - pr[:3]
 
     def cpu(self) -> dict:
@@ -224,7 +226,7 @@ def pair_losses(frame: FrameTargets, preds: torch.Tensor, queries: list[int], pe
         out["n_kpt"] = int(joints.sum())
     roots_ok = frame.roots_valid[gi]
     if roots_ok.any():
-        pred_root = p[..., list(ROOT_JOINTS), :].mean(dim=-2)
+        pred_root = p[..., ROOT_SLICE, :].mean(dim=-2)
         rs = None if frame.root_sigma is None else frame.root_sigma[gi]
         err = noisy_l1((pred_root - frame.roots[gi]).abs(), None if rs is None else rs[..., None] / size, rs,
                        settings)
@@ -252,12 +254,14 @@ def pair_losses(frame: FrameTargets, preds: torch.Tensor, queries: list[int], pe
 
 
 def batch_pair_losses(sup: Supervision, preds: torch.Tensor, b: torch.Tensor, t: torch.Tensor,
-                      q: torch.Tensor, g: torch.Tensor, settings: LossSettings) -> dict:
+                      q: torch.Tensor, g: torch.Tensor, settings: LossSettings,
+                      pair_mask: torch.Tensor | None = None) -> dict:
     """:func:`pair_losses` for every matched pair of a batch at once.
 
     ``preds`` (L, B, T, Q, J, 3); ``b, t, q, g`` (M,) device index tensors of the pairs (lane,
     frame, query, person).  Sums run over all layers; counts are per layer and stay on the
-    device (no host syncs).  Invalid targets may hold NaN (data/golden.py leaves unlabeled
+    device (no host syncs).  ``pair_mask`` (M,) optionally disables pairs (dense evaluation of
+    every query with a mask instead of a variable-length list).  Invalid targets may hold NaN (data/golden.py leaves unlabeled
     frames NaN): they are replaced before any arithmetic so no NaN reaches the gradients.
     """
     zero = preds.new_zeros(())
@@ -267,6 +271,8 @@ def batch_pair_losses(sup: Supervision, preds: torch.Tensor, b: torch.Tensor, t:
     p = preds[:, b, t, q]                                                     # (L, M, J, 3)
     size = sup.range_size
     joints = sup.keypoint_valid[b, t, g]                                      # (M, J)
+    if pair_mask is not None:
+        joints = joints & pair_mask[:, None]
     err = (p - torch.where(joints[..., None], sup.gt[b, t, g], 0.0)).abs()
     if sup.sigma is not None:
         sigma = torch.where(joints, sup.sigma[b, t, g], 0.0)
@@ -274,7 +280,9 @@ def batch_pair_losses(sup: Supervision, preds: torch.Tensor, b: torch.Tensor, t:
     out["kpt"] = torch.where(joints[..., None], err, 0.0).sum()
     out["n_kpt"] = joints.sum()
     roots_ok = sup.root_valid[b, t, g]                                        # (M,)
-    pred_root = p[..., list(ROOT_JOINTS), :].mean(dim=-2)                     # (L, M, 3)
+    if pair_mask is not None:
+        roots_ok = roots_ok & pair_mask
+    pred_root = p[..., ROOT_SLICE, :].mean(dim=-2)                     # (L, M, 3)
     err = (pred_root - torch.where(roots_ok[..., None], sup.root[b, t, g], 0.0)).abs()
     if sup.root_sigma is not None:
         rs = torch.where(roots_ok, sup.root_sigma[b, t, g], 0.0)
@@ -283,6 +291,8 @@ def batch_pair_losses(sup: Supervision, preds: torch.Tensor, b: torch.Tensor, t:
     out["n_root"] = roots_ok.sum()
     if sup.kp2d is not None and settings.reproj_weight > 0:
         weight = torch.where(sup.located[b, t, g], settings.reproj_triangulated_weight, 1.0).float()  # (M,)
+        if pair_mask is not None:
+            weight = weight * pair_mask
         valid = sup.kp2d_valid[b, t, :, g] & (weight > 0)[:, None, None]                    # (M, N, J)
         target = torch.where(valid[..., None], sup.kp2d[b, t, :, g], 0.0)                    # (M, N, J, 3)
         mm = p.float() * size + sup.range_min

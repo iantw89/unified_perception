@@ -62,15 +62,26 @@ class YOLOPoseBackbone(nn.Module):
     normalizes_uint8: bool = True
     #: frozen trunk in channels_last memory format (faster bf16 convolutions).
     channels_last: bool = True
+    #: frozen trunk under autocast: run a cached low-precision copy (no per-call weight casts).
+    cast_frozen_trunk: bool = True
 
     def _drop_fused(self, *args, **kwargs):
         self.__dict__["_fused"] = None
+        self.__dict__["_fused_cast"] = None
 
     def _apply(self, fn, *args, **kwargs):
         self.__dict__["_fused"] = None
+        self.__dict__["_fused_cast"] = None
         return super()._apply(fn, *args, **kwargs)
 
-    def _fused_trunk(self):
+    def _fused_trunk(self, dtype: torch.dtype | None = None):
+        """Fused (Conv+BN) frozen trunk; with ``dtype`` a cached copy in that dtype, so autocast
+        does not re-cast every frozen weight on every chunk (thousands of copies per step)."""
+        if dtype is not None:
+            cached = self.__dict__.get("_fused_cast")
+            if cached is None or cached[0] != dtype or self.__dict__["_fused"] is None:
+                self.__dict__["_fused_cast"] = (dtype, copy.deepcopy(self._fused_trunk()).to(dtype))
+            return self.__dict__["_fused_cast"][1]
         if self.__dict__["_fused"] is None:
             fused = copy.deepcopy(self.yolo)
             if hasattr(fused, "fuse"):
@@ -140,10 +151,20 @@ class YOLOPoseBackbone(nn.Module):
         tapped: dict[int, torch.Tensor] = {}
         save = getattr(self.yolo, "save", None)
         keep = None if save is None or self._trainable else set(save)
+        cast_ctx = contextlib.nullcontext()
         if self._trainable:
             modules = self.yolo.model
         else:
-            modules = self._fused_trunk().model
+            # Under bf16/fp16 autocast, run a trunk already in that dtype with autocast off: the same
+            # low-precision weights autocast would produce, without casting them on every call.
+            amp_dtype = (torch.get_autocast_dtype("cuda") if x.is_cuda and torch.is_autocast_enabled("cuda")
+                         else None)
+            if amp_dtype is not None and not return_detections and self.cast_frozen_trunk:
+                modules = self._fused_trunk(amp_dtype).model
+                x = x.to(amp_dtype)
+                cast_ctx = torch.autocast("cuda", enabled=False)
+            else:
+                modules = self._fused_trunk().model
             if self.channels_last:
                 x = x.contiguous(memory_format=torch.channels_last)
         training_state = self.yolo.training
@@ -152,7 +173,7 @@ class YOLOPoseBackbone(nn.Module):
             self.yolo.train()
         _no_grad_ctx = torch.no_grad() if not self._trainable else contextlib.nullcontext()
         try:
-            with _no_grad_ctx:
+            with _no_grad_ctx, cast_ctx:
                 for i, m in enumerate(modules):
                     if m.f != -1:
                         x_in = (

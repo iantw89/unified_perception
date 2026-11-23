@@ -205,6 +205,10 @@ class ModelConfig:
     track_keep_score: float = 0.4    # inference: keep an active track
     track_max_inactive: int = 30     # inference: frames an inactive track waits for re-id
     track_nms_mm: float = 300.0      # inference: suppress births near reported people
+    # Training assignment entirely on the device (models/gpu_assignment.py): batched matching
+    # cost, a GPU Hungarian solver and tensor slot rules -- no per-frame host round trips.
+    # Same rules as the host path; random draws (drops, false tracks, ref noise) differ.
+    gpu_assignment: bool = False
 
     # --- Re-identification (models/reid.py; requires track_queries) ---
     # Identity embedding = fusion of a learned projection of the track query
@@ -232,6 +236,9 @@ class ModelConfig:
     # EMA of its appearance embedding, fused into the identity code.
     reid_external_model: Optional[str] = None
     reid_external_stride: int = 4
+    # > 0: run the crop network on exactly this many crops per call (the highest-weight usable
+    # views of live tracks), giving static shapes and no device sync; 0: every usable view.
+    reid_external_max_crops: int = 0
 
     # --- Query denoising (DN, training only) ---
     with_dn: bool = True
@@ -300,6 +307,11 @@ class TrainConfig:
     # On Windows the driver otherwise spills an over-grown cache into shared
     # system memory, which silently slows training several-fold.
     cuda_memory_fraction: float = 0.0
+    # Queue each step without waiting for the device (engine/step.py: step_deferred): a
+    # non-finite loss/gradient skips the update on the device (fused optimizer found_inf), and
+    # the step's scalars are read after the next step is queued.  Needs CUDA (fused AdamW);
+    # viz steps and other devices use the synchronous step.
+    deferred_step: bool = True
     eval_interval: int = 1  # epochs
     viz_batch_interval: int = 0  # save training viz every N global steps (0 = off)
     device: str = "auto"  # "auto" | "cuda" | "cpu" | "mps"

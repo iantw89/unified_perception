@@ -365,6 +365,8 @@ def train(cfg: Config, config_path: str | None = None, argv: list[str] | None = 
     _warn_thresh    = 2000.0   # print per-module diagnostics only above this gnorm
 
     epoch_peak_mem_gb: float = 0.0
+    deferred = bool(cfg.train.deferred_step) and ts.deferred_supported()
+    pending = None   # (PendingStep, context) of the queued deferred step
     for epoch in range(start_epoch, cfg.train.max_epochs):
         if cfg.train.max_steps and optimizer_steps >= cfg.train.max_steps:
             break
@@ -376,15 +378,95 @@ def train(cfg: Config, config_path: str | None = None, argv: list[str] | None = 
         skipped_steps = 0
         pbar = tqdm(train_loader, desc=f"epoch {epoch}")
         t_ready = time.perf_counter()
+
+        def finish(pending_step, ctx) -> bool:
+            """Book-keep a deferred step from its host copy; returns True when a checkpoint is due."""
+            nonlocal loss_ema, optimizer_steps, steps_this_epoch, skipped_steps, epoch_peak_mem_gb
+            values = pending_step.result()
+            step_no, loss_val, grad_norm = ctx["step"], values["loss"], values["grad_norm"]
+            if values["skipped"]:
+                bad = {k: v for k, v in values.items() if isinstance(v, float) and not math.isfinite(v)}
+                print(f"\n[step {step_no}] NON-FINITE loss={loss_val} gnorm={grad_norm} — optimizer step "
+                      f"skipped on device; streaming state reset.  Non-finite terms: {bad or 'none reported'}"
+                      f"  sequences: {ctx['sequences']}")
+                head = getattr(_unwrap(model), "head", None)
+                if head is not None and hasattr(head, "reset_memory"):
+                    head.reset_memory()
+                    head.track_output = None
+                for bank in (getattr(criterion, "reid", None), getattr(criterion, "reid_device", None)):
+                    if bank is not None:
+                        bank.reset()
+                skipped_steps += 1
+                return False
+            optimizer_steps += 1
+            steps_this_epoch += 1
+            loss_ema = loss_val if loss_ema is None else _EMA_DECAY * loss_ema + (1 - _EMA_DECAY) * loss_val
+            if step_no >= _EMA_WARMUP and loss_val > _SPIKE_FACTOR * loss_ema:
+                print(f"\n[step {step_no}] LOSS SPIKE: {loss_val:.4f} vs EMA {loss_ema:.4f}"
+                      f" (×{loss_val / loss_ema:.1f})")
+            if grad_norm >= _warn_thresh:
+                print(f"\n[step {step_no}] HIGH GRAD gnorm={grad_norm:.1f} (clip={cfg.train.grad_clip})")
+            alloc_gb, rsvd_gb = _gpu_mem_gb()
+            peak_gb = torch.cuda.max_memory_allocated() / 1e9
+            epoch_peak_mem_gb = max(epoch_peak_mem_gb, peak_gb)
+            metrics = {k: v for k, v in values.items() if k != "skipped"}
+            metrics.update(gpu_alloc_gb=alloc_gb, data_wait_s=ctx["data_wait"])
+            for k, v in metrics.items():
+                running[k] = running.get(k, 0.0) + (float(v) if isinstance(v, (int, float)) else 0.0)
+            if ctx["it"] % cfg.train.log_interval == 0:
+                pbar.set_postfix(loss=f"{loss_val:.3f}", ema=f"{loss_ema:.3f}",
+                                 kpt=f"{metrics.get('loss_kpt', float('nan')):.3f}", gnorm=f"{grad_norm:.2f}",
+                                 mem=f"{alloc_gb:.1f}/{rsvd_gb:.1f}G", peak=f"{peak_gb:.1f}G",
+                                 wait=f"{ctx['data_wait']:.2f}s")
+                if writer:
+                    for k, v in metrics.items():
+                        writer.add_scalar(f"train/{k}", v, step_no)
+                    writer.add_scalar("sys/gpu_alloc_gb", alloc_gb, step_no)
+                    writer.add_scalar("sys/gpu_rsvd_gb", rsvd_gb, step_no)
+                    writer.add_scalar("train/loss_ema", loss_ema, step_no)
+            return bool(cfg.train.ckpt_every_steps and optimizer_steps % cfg.train.ckpt_every_steps == 0)
+
+        def drain():
+            """Finish the in-flight deferred step (before checkpoints, viz steps, epoch end)."""
+            nonlocal pending
+            if pending is not None:
+                done, pending = pending, None
+                if finish(*done):
+                    _save_checkpoint(last_path, checkpoint(epoch, epoch_complete=False))
+
         for it, batch in enumerate(pbar):
             # Time blocked on the DataLoader since the previous step finished (input-bound if large).
             data_wait = time.perf_counter() - t_ready
-            if cfg.train.max_steps and optimizer_steps >= cfg.train.max_steps:
-                break
+            if cfg.train.max_steps and optimizer_steps + (pending is not None) >= cfg.train.max_steps:
+                drain()
+                if optimizer_steps >= cfg.train.max_steps:
+                    break
             # Determine whether this step needs 2-D detections for visualisation
             # so we can fold it into the single training forward pass.
             viz_batch_interval = cfg.train.viz_batch_interval
             do_viz = viz_batch_interval > 0 and global_step % viz_batch_interval == 0
+
+            if deferred and not do_viz:
+                # No host synchronization in the step: its scalars are read after the next step
+                # is queued (engine/step.py: TrainStep.step_deferred).
+                ts.h2d(batch)
+                ts.normalize()
+                warmup_step = optimizer_steps + (pending is not None) if cfg.train.max_steps else global_step
+                if warmup_step < cfg.train.warmup_iters:
+                    for g in optimizer.param_groups:
+                        g["lr"] = cfg.train.lr * (warmup_step + 1) / cfg.train.warmup_iters
+                ts.forward()
+                ctx = {"step": global_step, "it": it, "data_wait": data_wait,
+                       "sequences": list(zip(batch.get("seq", []), batch.get("start", [])))}
+                current = (ts.step_deferred(cfg.train.grad_clip), ctx)
+                global_step += 1
+                previous, pending = pending, current
+                if previous is not None and finish(*previous):
+                    drain()   # the queued step too, so the checkpoint's step count is exact
+                    _save_checkpoint(last_path, checkpoint(epoch, epoch_complete=False))
+                t_ready = time.perf_counter()
+                continue
+            drain()
 
             # Snapshot raw images BEFORE h2d/normalize so visualization has
             # un-normalised pixels.  CUDAPrefetcher makes batch["imgs"] a
@@ -536,6 +618,7 @@ def train(cfg: Config, config_path: str | None = None, argv: list[str] | None = 
                     if loss_ema is not None:
                         writer.add_scalar("train/loss_ema", loss_ema, global_step)
             t_ready = time.perf_counter()
+        drain()
 
         n = max(steps_this_epoch, 1)
         train_loss = running.get("loss", 0.0) / n

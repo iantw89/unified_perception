@@ -29,6 +29,16 @@ from .tracking import TrackManager
 from .yolo_backbone import YOLOPoseBackbone
 
 
+
+def _host_index(mask_host: Optional[torch.Tensor], device) -> Optional[torch.Tensor]:
+    """Flat long index of the True entries of a CPU mask, on ``device`` without a sync."""
+    if mask_host is None:
+        return None
+    index = mask_host.reshape(-1).nonzero().squeeze(1)
+    if torch.device(device).type == "cuda":
+        return index.pin_memory().to(device, non_blocking=True)
+    return index.to(device)
+
 class UnifiedPerceptionModel(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -96,7 +106,8 @@ class UnifiedPerceptionModel(nn.Module):
             reid_dims=m.reid_dims if m.track_queries else 0,
             reid_appearance=m.reid_appearance,
             reid_ema=m.reid_ema,
-            external_reid=(ExternalReID(resolve_repo_path(m.reid_external_model))
+            external_reid=(ExternalReID(resolve_repo_path(m.reid_external_model),
+                                        max_crops=getattr(m, "reid_external_max_crops", 0))
                            if m.track_queries and m.reid_dims and m.reid_external_model else None),
             external_stride=m.reid_external_stride,
             pixel_mean=cfg.data.pixel_mean,
@@ -110,7 +121,12 @@ class UnifiedPerceptionModel(nn.Module):
         # Exclude padding from the backbone, including trainable BatchNorm statistics.
         # uint8 images are normalized chunk by chunk inside the backbone call (a float32
         # copy of the whole window would cost ~1 GB per batch).
-        images = flat_images if active is None else flat_images[active]
+        # ``active`` is a boolean mask or (preferred) the long index of the active views; an index
+        # built on the host avoids the device synchronization of boolean-mask indexing.
+        index = None
+        if active is not None:
+            index = active.nonzero().squeeze(1) if active.dtype == torch.bool else active
+        images = flat_images if index is None else flat_images.index_select(0, index)
         mean, std = self.input_mean.view(1, 3, 1, 1), self.input_std.view(1, 3, 1, 1)
         if getattr(self.backbone, "normalizes_uint8", False):
             feats_list, dets = self.backbone(images, return_detections=return_detections,
@@ -119,12 +135,11 @@ class UnifiedPerceptionModel(nn.Module):
             if images.dtype == torch.uint8:
                 images = (images.float() - mean) / std
             feats_list, dets = self.backbone(images, return_detections=return_detections)
-        if active is not None:
+        if index is not None:
             padded_feats = []
             for feat in feats_list:
                 padded = feat.new_zeros(flat_images.shape[0], *feat.shape[1:])
-                padded[active] = feat
-                padded_feats.append(padded)
+                padded_feats.append(padded.index_copy(0, index, feat))
             feats_list = padded_feats
         return feats_list, dets
 
@@ -135,6 +150,7 @@ class UnifiedPerceptionModel(nn.Module):
         intrinsics_t:      Optional[torch.Tensor], # (B, N, 4, 4) or None
         return_detections: bool = False,
         camera_valid: Optional[torch.Tensor] = None,
+        active_index: Optional[torch.Tensor] = None,  # long index of active views (host-built)
     ):
         """Run the backbone and build per-token calibration codes.
 
@@ -153,8 +169,8 @@ class UnifiedPerceptionModel(nn.Module):
         C = self.embed_dims
 
         active = None if camera_valid is None else camera_valid.reshape(-1)
-        feats_list, dets_flat = self._run_backbone(imgs_t.reshape(B * N, 3, H, W), active,
-                                                   return_detections)
+        feats_list, dets_flat = self._run_backbone(
+            imgs_t.reshape(B * N, 3, H, W), active if active_index is None else active_index, return_detections)
         if active is not None:
             if return_detections:
                 detections = iter(dets_flat)
@@ -187,7 +203,7 @@ class UnifiedPerceptionModel(nn.Module):
         # Per-token camera calibration code for spatial alignment (MLN).
         if intrinsics_t is not None:
             K    = intrinsics_t.float()
-            extr = torch.matmul(torch.linalg.inv(K), world2img_t.float())
+            extr = torch.matmul(torch.linalg.inv_ex(K).inverse, world2img_t.float())  # _ex: no error-check sync
             # extr = [R | t] where t is in mm.  fx/fy are already /1000.
             # Normalize translation column by 1000 as well so all 14 elements
             # are O(1-5); raw mm values (±3000) would push the MLN reduce-layer
@@ -215,6 +231,7 @@ class UnifiedPerceptionModel(nn.Module):
         camera_valid:       Optional[torch.Tensor] = None,  # (B, T, N), True for real views
         track_targets:      Optional[dict] = None,
         stream_reset:       Optional[torch.Tensor] = None,  # (B,) bool
+        camera_valid_host:  Optional[torch.Tensor] = None,  # CPU copy of camera_valid (no device sync)
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict], Optional[list]]:
         """Forward pass over a temporal window.
 
@@ -243,8 +260,14 @@ class UnifiedPerceptionModel(nn.Module):
         if camera_valid is not None:
             if camera_valid.shape != (B, T, N) or camera_valid.dtype != torch.bool:
                 raise ValueError("camera_valid must be boolean with shape (B,T,N)")
-            if not camera_valid.any(dim=-1).all():
-                raise ValueError("Every sample frame must contain at least one valid camera")
+            host_mask = camera_valid_host if camera_valid_host is not None else (
+                None if camera_valid.is_cuda else camera_valid)
+            if host_mask is not None:
+                if not host_mask.any(dim=-1).all():
+                    raise ValueError("Every sample frame must contain at least one valid camera")
+            else:   # device mask without a host copy: checked asynchronously (no sync)
+                torch._assert_async(camera_valid.any(dim=-1).all(),
+                                    "Every sample frame must contain at least one valid camera")
             identity = torch.eye(4, device=world2img.device, dtype=world2img.dtype)
             world2img = torch.where(camera_valid[..., None, None], world2img, identity)
             if intrinsics is not None:
@@ -272,6 +295,7 @@ class UnifiedPerceptionModel(nn.Module):
                 imgs.reshape(B * T, N, *imgs.shape[3:]), world2img.reshape(B * T, N, 4, 4),
                 None if intrinsics is None else intrinsics.reshape(B * T, N, 4, 4),
                 camera_valid=None if camera_valid is None else camera_valid.reshape(B * T, N),
+                active_index=_host_index(camera_valid_host, imgs.device),
             )
             feats = ft.view(B, T, *ft.shape[1:])   # (B, T, N*sum_L, C)
             mlns = mt.view(B, T, *mt.shape[1:])    # (B, T, N*sum_L, 14)

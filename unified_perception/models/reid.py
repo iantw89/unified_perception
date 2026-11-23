@@ -168,6 +168,129 @@ class ReIDLoss:
             (slot["anchors"] if len(slot["anchors"]) < self.anchors else slot["recent"]).append(code)
 
 
+class DeviceReIDLoss:
+    """:class:`ReIDLoss` with the bank held in device tensors (``model.gpu_assignment``).
+
+    Same loss and bank rules -- per identity the first ``anchors`` codes ever inserted plus the
+    ``recent`` latest, at most one insertion per ``stride`` frames, entries taken in the reference
+    order (each frame's query codes in frame order, then the slots' EMA codes) -- with every step a
+    batched tensor operation, so nothing waits for the device.  Identities map to bank rows
+    through a per-lane table of ``rows`` entries; identities beyond it are not banked (the gym
+    golden set has 17 people, other sources at most ``max_people``).
+    """
+
+    def __init__(self, temperature: float, recent: int, anchors: int, stride: int, rows: int = 64):
+        self.temperature, self.recent, self.anchors, self.stride, self.rows = (
+            temperature, recent, anchors, stride, rows)
+        self.state = None
+
+    def reset(self):
+        self.state = None
+
+    _NEVER = -(1 << 40)
+
+    def _ensure(self, B: int, D: int, device):
+        s = self.state
+        if s is not None and s["codes"].shape[0] == B and s["codes"].shape[-1] == D and s["codes"].device == device:
+            return s
+        S, E = self.rows, self.anchors + self.recent
+        self.state = s = {                                             # row S is a write sink
+            "codes": torch.zeros(B, S + 1, E, D, device=device),
+            "valid": torch.zeros(B, S + 1, E, dtype=torch.bool, device=device),
+            "ids": torch.full((B, S + 1), -1, dtype=torch.long, device=device),
+            "n_anchor": torch.zeros(B, S + 1, dtype=torch.long, device=device),
+            "ptr": torch.zeros(B, S + 1, dtype=torch.long, device=device),
+            "last": torch.full((B, S + 1), self._NEVER, dtype=torch.long, device=device),
+            "clock": torch.zeros(B, dtype=torch.long, device=device),
+        }
+        return s
+
+    def _clear(self, s, lanes: torch.Tensor):
+        row = lanes.view(-1, 1)
+        s["valid"].masked_fill_(lanes.view(-1, 1, 1), False)
+        s["ids"].masked_fill_(row, -1)
+        s["n_anchor"].masked_fill_(row, 0)
+        s["ptr"].masked_fill_(row, 0)
+        s["last"].masked_fill_(row, self._NEVER)
+        s["clock"].masked_fill_(lanes, 0)
+
+    def __call__(self, codes: torch.Tensor, labels: torch.Tensor, frames: torch.Tensor, mask: torch.Tensor,
+                 groups: list[torch.Tensor], stream_reset: torch.Tensor | None, window_len: int):
+        """codes (B, n, D) with grad; labels / frames (B, n) long; mask (B, n) bool.
+
+        ``groups``: (n,) bool masks of entry blocks inserted one after the other (each block has
+        at most one entry per identity).  Returns (loss, number of usable anchors), both tensors.
+        """
+        B, n, D = codes.shape
+        device = codes.device
+        s = self._ensure(B, D, device)
+        self._clear(s, torch.ones(B, dtype=torch.bool, device=device) if stream_reset is None
+                    else stream_reset.to(device=device, dtype=torch.bool))
+
+        S, E = self.rows, self.anchors + self.recent
+        bank = s["codes"][:, :S].reshape(B, S * E, D)
+        bank_valid = s["valid"][:, :S].reshape(B, S * E)
+        bank_ids = s["ids"][:, :S, None].expand(B, S, E).reshape(B, S * E)
+        keys = torch.cat([codes, bank.to(codes.dtype)], dim=1)                      # (B, n + SE, D)
+        key_valid = torch.cat([mask, bank_valid], dim=1)
+        key_ids = torch.cat([labels, bank_ids], dim=1)
+        key_frames = torch.cat([frames, torch.full_like(bank_ids, -1)], dim=1)
+        sim = codes @ keys.transpose(1, 2) / self.temperature                     # (B, n, n + SE)
+        eye = torch.zeros(n, n + S * E, dtype=torch.bool, device=device)
+        eye[:, :n] = torch.eye(n, dtype=torch.bool, device=device)
+        same = (labels[:, :, None] == key_ids[:, None, :]) & key_valid[:, None, :]
+        same_frame = frames[:, :, None] == key_frames[:, None, :]
+        positive = same & ~eye & ~same_frame
+        usable = mask & positive.any(-1) & (key_valid[:, None, :] & ~same).any(-1)
+        logits = sim.masked_fill(eye | (same & same_frame) | ~key_valid[:, None, :], float("-inf"))
+        logits = torch.where(usable[..., None], logits, 0.0)       # unusable rows: finite, unused
+        log_prob = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+        per_anchor = -(log_prob.masked_fill(~positive, 0).sum(-1) / positive.sum(-1).clamp(min=1))
+        count = usable.sum()
+        loss = torch.where(usable, per_anchor, 0.0).sum() / count.clamp(min=1)
+
+        with torch.no_grad():
+            for block in groups:
+                self._insert(s, codes.detach().float(), labels, frames, mask & block)
+            s["clock"] += window_len
+        return loss, count
+
+    def _insert(self, s, codes, labels, frames, mask):
+        B, n, D = codes.shape
+        S, A, R = self.rows, self.anchors, self.recent
+        table = s["ids"][:, :S]                                                     # (B, S)
+        hit = (table[:, None, :] == labels[:, :, None]) & (table[:, None, :] >= 0)  # (B, n, S)
+        found = hit.any(-1)
+        row = hit.long().argmax(-1)
+        new = mask & ~found & (labels >= 0)
+        free = table < 0
+        free_rows = torch.sort((~free).long(), dim=1, stable=True).indices          # free rows first
+        rank = new.long().cumsum(1) - 1
+        alloc = torch.gather(free_rows, 1, rank.clamp(min=0, max=S - 1))
+        alloc = torch.where(rank < free.sum(1, keepdim=True), alloc, S)
+        row = torch.where(mask, torch.where(found, row, alloc), S)
+        s["ids"].scatter_(1, row, torch.where(row < S, labels, -1))
+        now = s["clock"][:, None] + frames
+        last = torch.gather(s["last"], 1, row)
+        insert = mask & (row < S) & (now - last >= self.stride)
+        row = torch.where(insert, row, S)
+        n_anchor = torch.gather(s["n_anchor"], 1, row)
+        ptr = torch.gather(s["ptr"], 1, row)
+        to_anchor = n_anchor < A
+        slot = torch.where(to_anchor, n_anchor, A + ptr)
+        flat = row * (A + R) + slot
+        s["codes"].view(B, -1, D).scatter_(1, flat[..., None].expand(B, n, D), codes)
+        s["valid"].view(B, -1).scatter_(1, flat, insert)
+        s["n_anchor"].scatter_(1, row, torch.where(to_anchor, n_anchor + 1, n_anchor))
+        s["ptr"].scatter_(1, row, torch.where(to_anchor, ptr, (ptr + 1) % max(R, 1)))
+        s["last"].scatter_(1, row, torch.where(insert, now, last))
+        s["ids"][:, S] = -1                                                         # keep the sink empty
+        s["valid"][:, S] = False
+        s["n_anchor"][:, S] = 0
+        s["ptr"][:, S] = 0
+        s["last"][:, S] = self._NEVER
+
+
 # --------------------------------------------------------------------------- #
 # External pretrained person re-ID network on per-view crops                   #
 # --------------------------------------------------------------------------- #
@@ -211,12 +334,16 @@ def person_crop_boxes(keypoints_mm: torch.Tensor, world2img: torch.Tensor, image
 class ExternalReID(nn.Module):
     """Frozen TorchScript re-ID network (tools/export_fastreid.py) applied to per-view crops."""
 
-    def __init__(self, path: str, crop_hw: tuple[int, int] = (384, 128), chunk: int = 256):
+    def __init__(self, path: str, crop_hw: tuple[int, int] = (384, 128), chunk: int = 256,
+                 max_crops: int = 0):
         super().__init__()
         self.net = torch.jit.load(path, map_location="cpu").eval()
         for parameter in self.net.parameters():
             parameter.requires_grad_(False)
         self.crop_hw, self.chunk = tuple(crop_hw), chunk
+        # > 0: a fixed number of crops per call (the highest-weight usable views), so the call has
+        # static shapes and never synchronizes; 0: exactly the usable views (one nonzero sync).
+        self.max_crops = max_crops
         self.device = torch.device("cpu")
         with torch.no_grad():
             self.dims = int(self.net(torch.zeros(1, 3, *self.crop_hw)).shape[-1])
@@ -228,7 +355,8 @@ class ExternalReID(nn.Module):
 
     @torch.no_grad()
     def forward(self, images_255: torch.Tensor, keypoints_mm: torch.Tensor, world2img: torch.Tensor,
-                camera_valid: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                camera_valid: torch.Tensor | None = None,
+                person_valid: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Visibility-weighted mean embedding per person (B, Q, E) and availability (B, Q).
 
         images_255: (B, N, 3, H, W) RGB in [0, 255]; keypoints_mm: (B, Q, J, 3).
@@ -243,11 +371,20 @@ class ExternalReID(nn.Module):
         Q = keypoints_mm.shape[1]
         boxes, weight = person_crop_boxes(keypoints_mm, world2img, (H, W), camera_valid,
                                           aspect=self.crop_hw[0] / self.crop_hw[1])
+        if person_valid is not None:
+            weight = weight * person_valid[..., None]
         out = images_255.new_zeros(B, Q, self.dims, dtype=torch.float32)
         usable = weight > 0
-        if not usable.any():
-            return out, usable.any(-1)
-        b, q, n = torch.nonzero(usable, as_tuple=True)
+        if self.max_crops > 0:
+            top_w, top = torch.topk(weight.reshape(-1), min(self.max_crops, weight.numel()))
+            b, rem = top // (Q * N), top % (Q * N)
+            q, n = rem // N, rem % N
+            keep = top_w > 0
+        else:
+            if not usable.any():
+                return out, usable.any(-1)
+            b, q, n = torch.nonzero(usable, as_tuple=True)
+            keep = None
         rois = torch.cat([(b * N + n).float()[:, None], boxes[b, q, n]], dim=1)
         crops = roi_align(images_255.reshape(B * N, 3, H, W).float(), rois, self.crop_hw,
                           spatial_scale=1.0, sampling_ratio=2, aligned=True)
@@ -256,7 +393,11 @@ class ExternalReID(nn.Module):
             embeds = torch.cat([self.net(crops[i:i + self.chunk].to(dtype))
                                 for i in range(0, len(crops), self.chunk)])
         w = weight[b, q, n][:, None]
-        out.index_put_((b, q), embeds.float() * w, accumulate=True)
+        out.index_put_((b, q), embeds.float() * w, accumulate=True)   # dropped / unused crops: w = 0
+        if keep is not None:   # views beyond the budget do not count towards the normalization
+            kept = torch.zeros_like(weight).index_put_((b, q, n), keep.to(weight.dtype))
+            weight = weight * kept
+            usable = weight > 0
         total = weight.sum(-1)
         out = F.normalize(out / total.clamp(min=1e-6)[..., None], dim=-1)
         return out, usable.any(-1)

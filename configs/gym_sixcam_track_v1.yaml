@@ -99,6 +99,9 @@ model:
   track_keep_score: 0.4
   track_max_inactive: 30
   track_nms_mm: 300.0
+  # Training assignment on the device (models/gpu_assignment.py): batched cost, GPU Hungarian
+  # (torch-linear-assignment Triton kernel), tensor slot rules; no per-frame host round trips.
+  gpu_assignment: true
   # Re-identification: query-projection (implicit body shape/motion, per-track EMA)
   # fused with multi-view appearance codes; contrastive loss vs a per-lane bank.
   # reid_wait_frames / reid_threshold are inference-only: sweep them with
@@ -119,6 +122,9 @@ model:
   # Off-the-shelf on the gym GT: same/different-person AUC 0.93, 84% rank-1 of 15.
   reid_external_model: weights/reid/msmt_sbs_R50.ts
   reid_external_stride: 8   # 0.8 s at 10 fps; the per-track appearance EMA changes slowly
+  # Fixed crop budget (static shapes, no device sync); usable crops per call measured on the
+  # golden cache: mean 84, max 123 (4 lanes x live tracks x usable views).
+  reid_external_max_crops: 160
   with_dn: true
   dn_scalar: 10
   dn_noise_scale: 0.2

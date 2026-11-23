@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ..constants import ROOT_JOINTS
+from ..constants import ROOT_JOINTS, ROOT_SLICE
 
 
 def _tensor(value, *, dtype=None):
@@ -61,7 +61,7 @@ def collate_batch(samples):
         if "gt_root" in sample:
             roots.append(_tensor(sample["gt_root"], dtype=kpts.dtype))
         else:
-            roots.append(kpts[..., list(ROOT_JOINTS), :].mean(dim=-2))
+            roots.append(kpts[..., ROOT_SLICE, :].mean(dim=-2))
         root_valid.append(_tensor(sample.get("gt_root_valid", valid), dtype=torch.bool) & valid)
 
     out["gt_keypoint_frame_valid"] = torch.stack(frame_valid, dim=0)

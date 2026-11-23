@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from scipy.optimize import linear_sum_assignment
 
-from ..constants import ROOT_JOINTS
+from ..constants import ROOT_JOINTS, ROOT_SLICE
 
 
 @torch.no_grad()
@@ -76,7 +76,7 @@ def hungarian_cost(
         root_cost = pred_keypoints.new_zeros((Q, G))
         root_valid = torch.zeros(G, dtype=torch.bool, device=pred_keypoints.device)
     else:
-        pred_root = pred_keypoints[:, ROOT_JOINTS, :].mean(dim=1)
+        pred_root = pred_keypoints[:, ROOT_SLICE, :].mean(dim=1)
         root_cost = (pred_root[:, None] - gt_root.to(pred_root.device)[None]).abs().mean(dim=-1)
         root_valid = (
             torch.ones(G, dtype=torch.bool, device=pred_keypoints.device)
