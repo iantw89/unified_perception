@@ -85,12 +85,22 @@ def collect(cfg) -> list[tuple[Path, str]]:
     return members
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1 << 22), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+class _HashingWriter:
+    """Write-through file wrapper that hashes and counts every byte written."""
+
+    def __init__(self, raw):
+        self.raw, self.digest, self.bytes = raw, hashlib.sha256(), 0
+
+    def write(self, data) -> int:
+        self.digest.update(data)
+        self.bytes += len(data)
+        return self.raw.write(data)
+
+    def tell(self) -> int:
+        return self.bytes
+
+    def flush(self) -> None:
+        self.raw.flush()
 
 
 def main() -> None:
@@ -117,12 +127,16 @@ def main() -> None:
     while index < len(members):
         name = f"bundle-{len(shards):03d}.tar"
         path, size, count = args.out / name, 0, 0
-        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as tar:
-            while index < len(members) and (count == 0 or size < limit):
-                source, arcname = members[index]
-                tar.add(str(source), arcname=arcname, recursive=False)
-                size, count, index = size + source.stat().st_size, count + 1, index + 1
-        shards.append({"name": name, "bytes": path.stat().st_size, "files": count, "sha256": _sha256(path)})
+        # Size and digest of the bytes as written: a Google Drive for desktop folder reports a stale
+        # size (and serves stale content) for a file just closed, so re-reading it is unreliable.
+        with open(path, "wb") as raw:
+            sink = _HashingWriter(raw)
+            with tarfile.open(fileobj=sink, mode="w", format=tarfile.PAX_FORMAT) as tar:
+                while index < len(members) and (count == 0 or size < limit):
+                    source, arcname = members[index]
+                    tar.add(str(source), arcname=arcname, recursive=False)
+                    size, count, index = size + source.stat().st_size, count + 1, index + 1
+        shards.append({"name": name, "bytes": sink.bytes, "files": count, "sha256": sink.digest.hexdigest()})
         print(f"  {name}: {count} files, {shards[-1]['bytes'] / 1e9:.2f} GB "
               f"({index}/{len(members)}, {time.perf_counter() - start:.0f} s)", flush=True)
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True).stdout.strip()
