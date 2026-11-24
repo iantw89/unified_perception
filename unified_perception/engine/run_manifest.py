@@ -60,7 +60,7 @@ SECTIONS: dict[str, list[str]] = {
         "model.track_max_inactive", "model.track_nms_mm",
     ],
     "reid": [
-        "model.reid_dims", "model.reid_appearance", "model.reid_ema", "model.reid_loss_weight",
+        "model.reid_dims", "model.reid_appearance", "model.reid_ema", "model.reid_loss_weight", "model.reid_query_grad_scale",
         "model.reid_temperature", "model.reid_bank_recent", "model.reid_bank_anchors", "model.reid_bank_stride",
         "model.reid_external_model", "model.reid_external_stride",
     ],

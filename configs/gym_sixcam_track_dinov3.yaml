@@ -122,6 +122,11 @@ model:
   reid_appearance: true
   reid_ema: 0.9
   reid_loss_weight: 1.0
+  # Gradient attribution on gym_sixcam_track_v1 last.pt (step 35.6k, 2026-11-24): with clip 1.0 the
+  # total norm is ~1.3-1.9 (always clipped); re-ID is ~70% of the logged loss but its gradient into
+  # the shared decoder (0.33) exceeds each pose term (kpt 0.17, root 0.31).  Halve it there; the
+  # identity head still learns from the full loss.
+  reid_query_grad_scale: 0.5
   reid_temperature: 0.1
   reid_bank_recent: 16
   reid_bank_anchors: 4

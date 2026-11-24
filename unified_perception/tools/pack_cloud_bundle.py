@@ -43,6 +43,7 @@ def _rel(path: Path) -> str:
 def collect(cfg) -> list[tuple[Path, str]]:
     """(source path, archive name) for every file the run needs."""
     from ..data.streaming import aligned_component
+    from .cache_eval_windows import window_keys
     members: list[tuple[Path, str]] = []
     manifest = (REPO_ROOT / cfg.data.composition_manifest).resolve()
     comp_root = manifest.parent.parent                       # data/<experiment>/ (cache/ inside)
@@ -64,7 +65,7 @@ def collect(cfg) -> list[tuple[Path, str]]:
     if cfg.data.gym_mix_aligned_dirs and cfg.data.gym_mix_aligned_fraction > 0:
         for split in ("val", "train"):
             component = aligned_component(cfg, split, cache=True)
-            keys = [k for g in component.groups for k in g]
+            keys = window_keys(cfg, split, component)
             absent = [k for k in keys if not component.load.path(k).exists()]
             if absent:
                 raise SystemExit(f"aligned {split} cache incomplete: {len(absent)}/{len(keys)} windows missing "

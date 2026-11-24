@@ -15,6 +15,8 @@ Domain-specific adaptations vs the original StreamPETR:
 
 from __future__ import annotations
 
+import math
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -63,6 +65,7 @@ class SparseHead(nn.Module):
         reid_dims: int = 0,
         reid_appearance: bool = True,
         reid_ema: float = 0.9,
+        reid_query_grad_scale: float = 1.0,
         external_reid: Optional[nn.Module] = None,
         external_stride: int = 4,
         pixel_mean: Optional[List[float]] = None,
@@ -128,6 +131,10 @@ class SparseHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(embed_dims, 1),
         )
+        # Focal-loss prior (RetinaNet / DETR family): start every query at p = 0.01 "person".
+        # From p = 0.5 the many negatives make the classification gradient ~500x the pose terms at
+        # initialization, so the global gradient clip shrinks every other loss's update.
+        nn.init.constant_(cls_branch[-1].bias, -math.log((1 - 0.01) / 0.01))
         reg_branch = nn.Sequential(
             nn.Linear(embed_dims, embed_dims),
             nn.ReLU(inplace=True),
@@ -164,7 +171,8 @@ class SparseHead(nn.Module):
                              persistent=False)
         self._frames_seen = 0
         if reid_dims > 0:
-            self.identity_head = IdentityHead(embed_dims, reid_dims, reid_appearance, self.external_dims)
+            self.identity_head = IdentityHead(embed_dims, reid_dims, reid_appearance, self.external_dims,
+                                              query_grad_scale=reid_query_grad_scale)
         if max_tracks > 0:
             # Marks track slots apart from detection queries in self-attention.
             self.track_embedding = nn.Parameter(torch.zeros(embed_dims))

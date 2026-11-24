@@ -248,6 +248,9 @@ class ModelConfig:
     reid_ema: float = 0.9            # per-track EMA of identity codes
     reid_loss_weight: float = 1.0
     reid_temperature: float = 0.1
+    # Gradient of the re-ID loss into the shared decoder query, relative to the identity head's own
+    # (1 = plain; < 1 keeps the contrastive term from dominating the clipped update; 0 = detached).
+    reid_query_grad_scale: float = 1.0
     reid_bank_recent: int = 16       # per identity: recent bank entries ...
     reid_bank_anchors: int = 4       # ... plus the first entries ever seen (long gaps)
     reid_bank_stride: int = 8        # frames between bank insertions per identity

@@ -27,10 +27,10 @@ log() { printf '\n== %s\n' "$*"; }
 log "GPU / driver"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 DRIVER_MAJOR=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
-# CUDA 13.0 wheels need driver >= 580; older drivers get the CUDA 12.8 build.
-if [ "$DRIVER_MAJOR" -ge 580 ]; then TORCH_INDEX=https://download.pytorch.org/whl/cu130
-else TORCH_INDEX=https://download.pytorch.org/whl/cu128; fi
-echo "torch index: $TORCH_INDEX ($(nproc) vCPU, $(df -h "$WORK" 2>/dev/null | tail -1 | awk '{print $4}') free on WORK)"
+# The CUDA 13.0 torch / mmcv wheels need driver >= 580 (create the pod with minCudaVersion 13.0).
+if [ "$DRIVER_MAJOR" -lt 580 ]; then echo "driver $DRIVER_MAJOR < 580: CUDA 13.0 wheels will not run" >&2; exit 1; fi
+mkdir -p "$WORK"
+echo "$(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB RAM, $(df -h "$WORK" | tail -1 | awk '{print $4}') free on WORK"
 
 log "Repository"
 mkdir -p "$WORK"
@@ -44,10 +44,17 @@ cd "$REPO"
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -q --upgrade pip
-pip install -q torch torchvision torchcodec --index-url "$TORCH_INDEX"
+# Same versions as the workstation (torch 2.12.1); the mmcv wheel below is built against 2.12 / cu130.
+TORCH_INDEX=https://download.pytorch.org/whl/cu130
+pip install -q torch==2.12.1 torchvision==0.27.1 torchcodec==0.14.0 --index-url "$TORCH_INDEX"
 # requirements.txt pins the Windows workstation's torch index; install the rest from PyPI.
 grep -v -E '^--index-url|^(torch|torchvision|torchcodec)([<>=;[:space:]]|$)' requirements.txt > /tmp/requirements-pod.txt
 pip install -q -r /tmp/requirements-pod.txt
+# models/transformer.py imports mmcv (multi-scale deformable attention CUDA op): prebuilt wheel,
+# the same build the workstation uses (MiroPsota/torch_packages_builder, mmcv main @ a8073c7).
+pip install -q mmengine==0.10.7 \
+    "https://github.com/MiroPsota/torch_packages_builder/releases/download/mmcv-2.2.0%2Ba8073c7/mmcv-2.2.0%2Ba8073c7pt2.12.0cu130-cp312-cp312-linux_x86_64.whl"
+python -c "from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttnFunction; print('mmcv MSDA ok')"
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, torch.cuda.get_device_name(0))"
 
 log "Data bundle"

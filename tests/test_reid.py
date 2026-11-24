@@ -119,3 +119,20 @@ def test_head_with_reid_trains_identity_codes():
     with torch.no_grad():
         head(feats, codes, projection, [(2, 2)], (16, 16))
     assert head.track_output["aliases"] == [] and head.track_state.gallery_code.shape == (B, 128, 8)
+
+
+def test_identity_head_query_grad_scale():
+    """reid_query_grad_scale scales only the gradient reaching the shared query, not the head's."""
+    import torch
+    from unified_perception.models.reid import IdentityHead
+    grads = {}
+    for scale in (1.0, 0.25, 0.0):
+        torch.manual_seed(0)
+        head = IdentityHead(16, 8, appearance=False, query_grad_scale=scale)
+        q = torch.randn(2, 5, 16, requires_grad=True)
+        code = head(q)
+        code[..., 0].sum().backward()
+        grads[scale] = (None if q.grad is None else q.grad.clone(), head.query_proj[0].weight.grad.clone())
+    assert torch.allclose(grads[0.25][0], 0.25 * grads[1.0][0])
+    assert grads[0.0][0] is None or grads[0.0][0].abs().sum() == 0
+    assert torch.allclose(grads[0.25][1], grads[1.0][1]) and torch.allclose(grads[0.0][1], grads[1.0][1])

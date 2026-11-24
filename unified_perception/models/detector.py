@@ -131,6 +131,7 @@ class UnifiedPerceptionModel(nn.Module):
             reid_dims=m.reid_dims if m.track_queries else 0,
             reid_appearance=m.reid_appearance,
             reid_ema=m.reid_ema,
+            reid_query_grad_scale=getattr(m, "reid_query_grad_scale", 1.0),
             external_reid=(ExternalReID(resolve_repo_path(m.reid_external_model),
                                         max_crops=getattr(m, "reid_external_max_crops", 0))
                            if m.track_queries and m.reid_dims and m.reid_external_model else None),

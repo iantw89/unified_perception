@@ -35,11 +35,36 @@ def _mlp(i: int, h: int, o: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(i, h), nn.ReLU(inplace=True), nn.Linear(h, o))
 
 
+class _ScaleGrad(torch.autograd.Function):
+    """Identity forward; multiplies the gradient by ``scale`` on the way back."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+
+
+def scale_grad(x: torch.Tensor, scale: float) -> torch.Tensor:
+    if scale == 1.0 or not x.requires_grad:
+        return x
+    return x.detach() if scale == 0.0 else _ScaleGrad.apply(x, scale)
+
+
 class IdentityHead(nn.Module):
     """Fuses the query projection with optional backbone and pretrained-network appearance codes."""
 
-    def __init__(self, embed_dims: int, reid_dims: int, appearance: bool, external_dims: int = 0):
+    def __init__(self, embed_dims: int, reid_dims: int, appearance: bool, external_dims: int = 0,
+                 query_grad_scale: float = 1.0):
         super().__init__()
+        # The decoder query is the only input shared with the pose / detection losses (appearance
+        # and external codes are sampled without gradient): scaling the gradient here bounds how
+        # much the contrastive loss steers the shared decoder, while the identity head itself
+        # still learns at the full loss weight.
+        self.query_grad_scale = float(query_grad_scale)
         self.query_proj = _mlp(embed_dims, embed_dims, reid_dims)
         self.appearance, self.external_dims = appearance, external_dims
         parts = 1
@@ -56,7 +81,7 @@ class IdentityHead(nn.Module):
 
     def forward(self, query: torch.Tensor, appearance: torch.Tensor | None = None,
                 external: torch.Tensor | None = None, external_valid: torch.Tensor | None = None) -> torch.Tensor:
-        parts = [self.query_proj(query)]
+        parts = [self.query_proj(scale_grad(query, self.query_grad_scale))]
         if self.appearance:
             parts.append(self.app_proj(appearance))
         if self.external_dims:
