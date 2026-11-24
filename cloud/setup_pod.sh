@@ -97,7 +97,7 @@ cat <<EOF
 
 Ready.  Launch (detached, resumable; logs in runs/<name>/console.log):
   cd $REPO && . .venv/bin/activate
-  OMP_NUM_THREADS=8 python -m unified_perception.tools.training_process start --config $CONFIG   # OMP: torch would size its pool to the host, not the quota
+  OMP_NUM_THREADS=8 TORCHINDUCTOR_CACHE_DIR=/workspace/inductor_cache python -m unified_perception.tools.training_process start --config $CONFIG   # OMP: torch would size its pool to the host, not the quota
   python -m unified_perception.tools.training_process status --config $CONFIG
 TensorBoard:  tensorboard --logdir runs --host 0.0.0.0 --port 6006   (expose port 6006 on the pod)
 EOF

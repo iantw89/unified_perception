@@ -1,6 +1,7 @@
 # Cloud (Linux, H100 80 GB, 16-32 vCPU) variant of gym_sixcam_track_dinov3: identical model and data,
 # scaled up and pointed at the bundle extracted by cloud/setup_pod.sh (see cloud/README.md).
-#   * batch 16 (4x): ~4.2 GB per lane at batch 4 on a 4090 -> ~70 GB; lr sqrt-scaled from batch 4.
+#   * batch 12 (3x), lr sqrt-scaled from batch 4.  H100 SXM bench 2026-11-24: batch 12 1.25 s/step,
+#     peak 56.7 GB; batch 16 1.65 s/step (same 9.7 windows/s), peak 75 GB and OOM on a heavier batch.
 #   * every window from the prebuilt caches (no source videos on the pod; misses are errors).
 #   * MOYO sequence metadata under data_cache/moyo_meta (same folder name -> same cache key).
 # DINOv3 backbone variant of gym_sixcam_track_v1 (identical data, losses, schedule): frozen
@@ -24,7 +25,7 @@ data:
   allow_fewer_cameras: true
   seq_len: 8
   # Mixed camera counts are padded and masked, not duplicated.
-  batch_size: 16
+  batch_size: 12
   # All sources come from local caches (~0.1-0.2 s per window): 14 workers on a 16-32 vCPU pod.
   num_workers: 14
   max_people: 24
@@ -177,7 +178,7 @@ train:
   max_epochs: 100000
   max_steps: 100000
   # sqrt-scaled from 1.9796e-4 at batch 4.
-  lr: 0.00039592
+  lr: 0.00034288
   weight_decay: 0.0001
   grad_clip: 1.0
   warmup_iters: 300
