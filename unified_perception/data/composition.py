@@ -95,7 +95,8 @@ class Clip:
 
 
 def _asset_path(root: Path, relative: str) -> Path:
-    path = (root / relative).resolve()
+    # Manifests written on Windows use backslashes, which are not separators on Linux.
+    path = (root / str(relative).replace("\\", "/")).resolve()
     if root.resolve() not in path.parents:
         raise ValueError("Cache paths must stay inside the manifest directory")
     return path

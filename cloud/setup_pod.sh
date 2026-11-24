@@ -49,7 +49,7 @@ TORCH_INDEX=https://download.pytorch.org/whl/cu130
 pip install -q torch==2.12.1 torchvision==0.27.1 torchcodec==0.14.0 --index-url "$TORCH_INDEX"
 # requirements.txt pins the Windows workstation's torch index; install the rest from PyPI.
 grep -v -E '^--index-url|^(torch|torchvision|torchcodec)([<>=;[:space:]]|$)' requirements.txt > /tmp/requirements-pod.txt
-pip install -q -r /tmp/requirements-pod.txt
+pip install -q -r /tmp/requirements-pod.txt pytest
 # models/transformer.py imports mmcv (multi-scale deformable attention CUDA op): prebuilt wheel,
 # the same build the workstation uses (MiroPsota/torch_packages_builder, mmcv main @ a8073c7).
 pip install -q mmengine==0.10.7 \
