@@ -124,8 +124,11 @@ def start_training(config: Path, run: Path) -> int:
     with pid_file.open("x", encoding="utf-8") as pid_stream:
         environment = os.environ.copy()
         environment["PYTHONIOENCODING"] = "utf-8"
-        environment.setdefault("PYTORCH_CUDA_ALLOC_CONF",
-                               "garbage_collection_threshold:0.8,max_split_size_mb:256")
+        if sys.platform == "win32":
+            # Tuned for the 24 GB workstation.  Not elsewhere: on the H100 pod (~55 of ~75 GB in use)
+            # the GC threshold reclaimed cached blocks every step, 1.29 -> 1.68 s/step (2026-11-24).
+            environment.setdefault("PYTORCH_CUDA_ALLOC_CONF",
+                                   "garbage_collection_threshold:0.8,max_split_size_mb:256")
         command = [sys.executable, "-u", "-m", "unified_perception.tools.train",
                    "--config", str(config), "--resume"]
         child = None
