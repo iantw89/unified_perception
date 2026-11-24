@@ -73,6 +73,7 @@ class UnifiedPerceptionModel(nn.Module):
             self.backbone = DinoV3SimpleFPNBackbone(
                 model_name, arch=BACKBONES[m.backbone].arch, out_channels=m.embed_dims,
                 trainable_blocks=m.vit_trainable_blocks, compile_trunk=m.vit_compile,
+                compile_mode=getattr(m, "vit_compile_mode", "max-autotune-no-cudagraphs"),
                 fpn_levels=m.vit_fpn_levels or fpn_levels_for(cfg.data.image_height, cfg.data.image_width))
         else:
             self.backbone = YOLOPoseBackbone(

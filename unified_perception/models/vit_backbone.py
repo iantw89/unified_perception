@@ -220,7 +220,8 @@ class DinoV3SimpleFPNBackbone(nn.Module):
 
     def __init__(self, weights: str | None, arch: str = "vitb16", out_channels: int = 256,
                  trainable_blocks: int = 0, frozen_dtype: torch.dtype = torch.bfloat16,
-                 compile_trunk: bool = False, fpn_levels: int = 3):
+                 compile_trunk: bool = False, fpn_levels: int = 3,
+                 compile_mode: str = "max-autotune-no-cudagraphs"):
         super().__init__()
         self.vit = DinoV3ViT(arch)
         if weights:
@@ -237,7 +238,7 @@ class DinoV3SimpleFPNBackbone(nn.Module):
         self.fpn = SimpleFPN(self.vit.dim, out_channels, fpn_levels)
         self.register_buffer("vit_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("vit_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1), persistent=False)
-        self.compile_trunk = compile_trunk
+        self.compile_trunk, self.compile_mode = compile_trunk, compile_mode
         # Frozen part as a low-precision copy kept outside the module tree (checkpoints keep the
         # fp32 keys); rebuilt on device or weight changes.
         self.__dict__["_trunk"] = None
@@ -261,7 +262,7 @@ class DinoV3SimpleFPNBackbone(nn.Module):
                 # dynamic batch so the variable last chunk does not recompile.  CUDA graphs bring
                 # nothing here (~150 launches per chunk).  CUDA inputs only (CPU inductor needs a
                 # C++ toolchain; e.g. the detector's construction-time channel probe runs on CPU).
-                compiled = torch.compile(fn, dynamic=True, mode="max-autotune-no-cudagraphs")
+                compiled = torch.compile(fn, dynamic=True, mode=self.compile_mode)
             self.__dict__["_trunk"] = (trunk, fn, compiled)
         return self.__dict__["_trunk"]
 

@@ -91,9 +91,10 @@ model:
   # Registered + hash-verified (models/backbones.py).  weights/dinov3/ is a gated download.
   backbone: dinov3_vitb16_lvd1689m
   vit_trainable_blocks: 0
-  # max-autotune recompiles for every new mix of image sizes / counts (25 s+ each, recurring on the
-  # streaming data); eager costs ~2.5% end-to-end.
-  vit_compile: false
+  # Default inductor mode: max-autotune benchmarked GEMMs for every new mix of image sizes / counts
+  # (25 s+ each, recurring on the streaming data and stalling steps for minutes).
+  vit_compile: true
+  vit_compile_mode: default
   # 0 = by image size: strides 8/16/32 at 640; a 1280 px experiment gets stride 64 too.
   vit_fpn_levels: 0
   yolo_trainable: false

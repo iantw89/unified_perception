@@ -184,6 +184,9 @@ class ModelConfig:
     vit_trainable_blocks: int = 0
     # torch.compile the frozen trunk (compute-bound: ~8% on a 4090; first steps pay compilation).
     vit_compile: bool = False
+    # torch.compile mode for the frozen trunk; "default" skips GEMM autotuning, whose per-shape
+    # benchmarking recurs on streams with many image-size / image-count mixes.
+    vit_compile_mode: str = "max-autotune-no-cudagraphs"
     # SimpleFPN levels: 3 = strides 8/16/32, 4 adds stride 64.  0 = by image size
     # (models/vit_backbone.py: fpn_levels_for): 3 at 640 px (a 10 x 10 stride-64 map is too coarse
     # to help), 4 from 1024 px (e.g. 1280 px: 20 x 20, needed for large people).
