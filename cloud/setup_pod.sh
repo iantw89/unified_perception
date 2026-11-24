@@ -77,7 +77,11 @@ for shard in manifest["shards"]:
         sys.exit(f"corrupt shard {path}")
 print(f"verified {len(manifest['shards'])} shards, {manifest['bytes'] / 1e9:.1f} GB, packed at commit {manifest['git_commit'][:10]}")
 PY
-for shard in "$SHARDS"/bundle-*.tar; do tar -xf "$shard" -C "$REPO"; done
+# Without KEEP_BUNDLE each shard is deleted once extracted (peak disk ~ bundle size + one shard).
+for shard in "$SHARDS"/bundle-*.tar; do
+    tar -xf "$shard" -C "$REPO"
+    [ "$KEEP_BUNDLE" = 1 ] || rm -f "$shard"
+done
 [ "$KEEP_BUNDLE" = 1 ] || rm -rf "$SHARDS"
 
 log "Persistent run outputs"
