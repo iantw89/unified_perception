@@ -201,6 +201,7 @@ def main() -> None:
     ap.add_argument("--eval-batches", type=int, default=6)
     ap.add_argument("--eval-split", default="val_gym")
     ap.add_argument("--out", default="runs/profile_stages")
+    ap.add_argument("--compile-decoder", action="store_true", help="torch.compile each decoder layer")
     args = ap.parse_args()
 
     cfg = load_config(args.config, args.overrides)
@@ -220,6 +221,9 @@ def main() -> None:
     std = torch.tensor(cfg.data.pixel_std, device=device).view(1, 1, 1, 3, 1, 1)
     ts = TrainStep(model, criterion, optimizer, mean, std, device, True)
     instrument(model, criterion)
+    if args.compile_decoder:
+        for i, layer in enumerate(model.head.decoder.layers):
+            model.head.decoder.layers[i] = torch.compile(layer, dynamic=True)
     # Loss / backward / optimizer markers around the TrainStep phases.
     _wrap(ts, "_criterion_outputs", "S:loss")
     orig_backward = torch.Tensor.backward

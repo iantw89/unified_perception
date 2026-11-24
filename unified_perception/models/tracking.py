@@ -102,6 +102,10 @@ class TrackState:
     def clone(self) -> "TrackState":
         return TrackState(**{f.name: getattr(self, f.name).clone() for f in fields(self)})
 
+    def to(self, device, non_blocking: bool = False) -> "TrackState":
+        return TrackState(**{f.name: getattr(self, f.name).to(device, non_blocking=non_blocking)
+                             for f in fields(self)})
+
 
 def root_of(kpts: torch.Tensor) -> torch.Tensor:
     return kpts[..., ROOT_SLICE, :].mean(dim=-2)
@@ -335,8 +339,24 @@ class TrackManager:
     def infer_step(self, state: TrackState, num_det: int, cls, kpts, feat, codes=None, ema=None, app=None):
         """Return (reported ids (B, Qm) long, -1 = not reported; new state; aliases).
 
-        ``aliases`` lists (lane, provisional id, recovered id) gallery takeovers.
+        ``aliases`` lists (lane, provisional id, recovered id) gallery takeovers.  The slot logic is
+        per lane and per track with scalar decisions, so it runs on host copies (one transfer each
+        way per frame) instead of synchronizing with the device on every ``int()`` / ``float()``.
         """
+        device = cls.device
+        if device.type == "cpu":
+            return self._infer_step(state, num_det, cls, kpts, feat, codes, ema, app)
+
+        def host(x):
+            return None if x is None else x.to("cpu", non_blocking=True)
+        args = (host(cls), host(kpts), host(feat), host(codes), host(ema),
+                None if app is None else (host(app[0]), host(app[1])))
+        state_h = state.to("cpu", non_blocking=True)
+        torch.cuda.current_stream(device).synchronize()   # the non-blocking copies above
+        reported, new, aliases = self._infer_step(state_h, num_det, *args)
+        return reported.to(device, non_blocking=True), new.to(device, non_blocking=True), aliases
+
+    def _infer_step(self, state: TrackState, num_det: int, cls, kpts, feat, codes=None, ema=None, app=None):
         B, Qm = cls.shape[:2]
         scores = cls[..., 0].float().sigmoid()
         roots_mm = root_of(kpts).float() * self.range_size.to(kpts.device) + self.range_min.to(kpts.device)

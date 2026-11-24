@@ -187,6 +187,10 @@ class ModelConfig:
     # torch.compile mode for the frozen trunk; "default" skips GEMM autotuning, whose per-shape
     # benchmarking recurs on streams with many image-size / image-count mixes.
     vit_compile_mode: str = "max-autotune-no-cudagraphs"
+    # torch.compile each decoder layer's forward (and so its backward): fuses the many small per-frame
+    # kernels of self-attention / cross-attention / FFN.  Compiles the bound method, so module and
+    # checkpoint keys are unchanged.
+    decoder_compile: bool = False
     # SimpleFPN levels: 3 = strides 8/16/32, 4 adds stride 64.  0 = by image size
     # (models/vit_backbone.py: fpn_levels_for): 3 at 640 px (a 10 x 10 stride-64 map is too coarse
     # to help), 4 from 1024 px (e.g. 1280 px: 20 x 20, needed for large people).

@@ -55,8 +55,12 @@ def _run_eval(model, loader, cfg, device, score_threshold, max_batches):
     for bi, batch in enumerate(tqdm(loader, desc="eval", leave=False)):
         if max_batches is not None and bi >= max_batches:
             break
-        imgs = batch["imgs"].to(device=device, dtype=torch.float32)
-        imgs.sub_(_norm_mean).div_(_norm_std)
+        imgs = batch["imgs"]
+        if imgs.dtype == torch.uint8:
+            imgs = imgs.to(device)   # the model normalizes per frame, as in training (no float window copy)
+        else:
+            imgs = imgs.to(device=device, dtype=torch.float32)
+            imgs.sub_(_norm_mean).div_(_norm_std)
         world2img = batch["world2img"].to(device)
         intrinsics = batch["intrinsics"].to(device)
         gt_kpts = batch["gt_keypoints"].to(device)  # (B,T,P,J,3) mm
@@ -102,6 +106,17 @@ def _run_eval(model, loader, cfg, device, score_threshold, max_batches):
         scores = cls_scores[-1, ..., 0].sigmoid()        # (B, T, Q)
         kpts_mm = model.denormalize_keypoints(kpts_norm[-1])  # (B, T, Q, J, 3)
 
+        # Everything the per-frame bookkeeping reads, copied to the host once per batch: indexing
+        # device tensors frame by frame cost one synchronization per .cpu() (~10k per batch).
+        def host(x):
+            return None if x is None else x.cpu()
+        scores, kpts_mm, kpts_last, track_ids = host(scores), host(kpts_mm), host(kpts_norm[-1].float()), host(track_ids)
+        located_all, gt_valid, gt_kpts, gt_root = host(located_all), host(gt_valid), host(gt_kpts), host(gt_root)
+        gt_root_valid, gt_keypoint_valid, gt_frame_valid = host(gt_root_valid), host(gt_keypoint_valid), host(gt_frame_valid)
+        kp2d, kp2d_valid, world2img_h = host(kp2d), host(kp2d_valid), host(world2img)
+        n_views = imgs.shape[2]
+        camera_valid = host(camera_valid)
+
         B, T = scores.shape[:2]
         for b in range(B):
             if stream_pad is not None and bool(stream_pad[b]):
@@ -121,7 +136,7 @@ def _run_eval(model, loader, cfg, device, score_threshold, max_batches):
                 two_d_assoc = []
                 if two_d.any() and keep.any():
                     keep, two_d_assoc = _match_two_d(
-                        keep, kpts_norm[-1, b, t], kp2d[b, t], kp2d_valid[b, t], world2img[b, t],
+                        keep, kpts_last[b, t], kp2d[b, t], kp2d_valid[b, t], world2img_h[b, t],
                         torch.nonzero(two_d).flatten(), model.position_range, cfg.eval.reproj_match_px)
                     two_d_stats[0] += len(two_d_assoc)
                 two_d_stats[1] += int(two_d.sum())
@@ -140,7 +155,7 @@ def _run_eval(model, loader, cfg, device, score_threshold, max_batches):
                 }
                 associations = acc.update_frame(pred, gt, **metric_args)
                 acc.credit_ambiguous(min(unlocated, len(pred) - len(associations)))
-                camera_count = imgs.shape[2] if camera_valid is None else int(camera_valid[b, t].sum())
+                camera_count = n_views if camera_valid is None else int(camera_valid[b, t].sum())
                 groups = [f"people_{len(gt)}", f"cameras_{camera_count}"]
                 if "capture_group" in batch:
                     groups.append("capture_" + batch["capture_group"][b])
@@ -150,7 +165,10 @@ def _run_eval(model, loader, cfg, device, score_threshold, max_batches):
                             pck_thresholds_mm=cfg.eval.pck_thresholds_mm,
                             match_threshold_mm=cfg.eval.match_threshold_mm,
                         )
-                    buckets[group].update_frame(pred, gt, **metric_args)
+                    # Same credit as the headline metric: predictions on people present without any
+                    # geometry are not false positives (otherwise unlabelled frames read as a flood).
+                    bucket_assoc = buckets[group].update_frame(pred, gt, **metric_args)
+                    buckets[group].credit_ambiguous(min(unlocated, len(pred) - len(bucket_assoc)))
                 if "instance_ids" in batch:
                     has_identity = True
                     queries = torch.nonzero(keep, as_tuple=True)[0]

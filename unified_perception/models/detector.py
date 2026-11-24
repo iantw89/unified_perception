@@ -140,6 +140,9 @@ class UnifiedPerceptionModel(nn.Module):
             pixel_mean=cfg.data.pixel_mean,
             pixel_std=cfg.data.pixel_std,
         )
+        if getattr(m, "decoder_compile", False):
+            for layer in self.head.decoder.layers:
+                layer.forward = torch.compile(layer.forward, dynamic=True)
 
     # ------------------------------------------------------------------ #
     def _run_backbone(self, flat_images: torch.Tensor, active: Optional[torch.Tensor],
