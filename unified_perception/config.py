@@ -191,6 +191,9 @@ class ModelConfig:
     # kernels of self-attention / cross-attention / FFN.  Compiles the bound method, so module and
     # checkpoint keys are unchanged.
     decoder_compile: bool = False
+    # Deformable-attention kernel inside the mmcv path: "mmcv" (CUDA, fp32) or "triton"
+    # (models/msda_triton.py: same layout and results, autotuned; forward 2-4x faster on a 4090).
+    msda_impl: str = "mmcv"
     # SimpleFPN levels: 3 = strides 8/16/32, 4 adds stride 64.  0 = by image size
     # (models/vit_backbone.py: fpn_levels_for): 3 at 640 px (a 10 x 10 stride-64 map is too coarse
     # to help), 4 from 1024 px (e.g. 1280 px: 20 x 20, needed for large people).

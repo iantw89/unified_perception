@@ -140,6 +140,14 @@ class UnifiedPerceptionModel(nn.Module):
             pixel_mean=cfg.data.pixel_mean,
             pixel_std=cfg.data.pixel_std,
         )
+        impl = getattr(m, "msda_impl", "mmcv")
+        if impl not in ("mmcv", "triton"):
+            raise ValueError(f"model.msda_impl must be 'mmcv' or 'triton', got {impl!r}")
+        if impl == "triton":
+            from .transformer import Detr3DCrossAttn
+            for module in self.modules():
+                if isinstance(module, Detr3DCrossAttn):
+                    module.triton_msda = True
         if getattr(m, "decoder_compile", False):
             for layer in self.head.decoder.layers:
                 layer.forward = torch.compile(layer.forward, dynamic=True)

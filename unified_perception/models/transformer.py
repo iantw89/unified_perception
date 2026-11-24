@@ -89,6 +89,7 @@ class Detr3DCrossAttn(nn.Module):
         self.num_levels    = num_levels
         self.num_pts       = num_pts
         self.use_mmcv_msda = use_mmcv_msda
+        self.triton_msda   = False   # set by the detector from model.msda_impl == "triton"
 
         # Predict num_pts 3D offsets from query content; init near-zero.
         self.learnable_fc = nn.Linear(embed_dims, num_pts * 3)
@@ -296,9 +297,13 @@ class Detr3DCrossAttn(nn.Module):
         im2col_step = B * N
 
         # Output: (B*N, Q, G*group_dims) = (B*N, Q, C)
-        out = MMCVMSDAfn.apply(
-            value, shapes_t, level_start_idx, locs, attn_w, im2col_step,
-        )
+        if self.triton_msda:
+            from .msda_triton import MSDATritonFunction
+            out = MSDATritonFunction.apply(value, shapes_t, level_start_idx, locs, attn_w)
+        else:
+            out = MMCVMSDAfn.apply(
+                value, shapes_t, level_start_idx, locs, attn_w, im2col_step,
+            )
 
         # Sum across cameras: (B*N, Q, C) → (B, N, Q, C) → (B, Q, C)
         return out.to(out_dtype).view(B, N, Q, C).sum(dim=1)
