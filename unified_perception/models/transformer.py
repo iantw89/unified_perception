@@ -37,15 +37,6 @@ except ImportError:
     MMCVMSDAfn = None
     MMCV_MSDA_AVAILABLE = False
 
-# DCNv4 "Flash Deformable Attention" (OpenGVLab/DCNv4, DCNv4_op): fp16, softmax fused in the kernel.
-# Optional; selected per model by ``model.msda_impl: flash`` (see Detr3DCrossAttn._forward_flash).
-try:
-    from DCNv4.functions.flash_deform_attn_func import FlashDeformAttnFunction as FlashMSDAfn
-    FLASH_MSDA_AVAILABLE = True
-except Exception:   # not installed, or an unsupported GPU (the module raises at import)
-    FlashMSDAfn = None
-    FLASH_MSDA_AVAILABLE = False
-
 _SHAPE_CACHE: dict = {}
 
 
@@ -98,7 +89,6 @@ class Detr3DCrossAttn(nn.Module):
         self.num_levels    = num_levels
         self.num_pts       = num_pts
         self.use_mmcv_msda = use_mmcv_msda
-        self.flash_msda    = False   # set by the detector from model.msda_impl
 
         # Predict num_pts 3D offsets from query content; init near-zero.
         self.learnable_fc = nn.Linear(embed_dims, num_pts * 3)
@@ -185,13 +175,7 @@ class Detr3DCrossAttn(nn.Module):
         )
         weights = weights.masked_fill(~valid_flat, float("-inf"))
         # No visible sampling points: avoid an all--inf softmax and NaN gradients.
-        any_valid = valid_flat.any(dim=-2, keepdim=True)                 # (B, Q, 1, 1)
-        weights = torch.where(any_valid, weights, 0.0)
-        if self.flash_msda and FLASH_MSDA_AVAILABLE and feats.is_cuda:
-            output = self._forward_flash(feats, u_n, v_n, weights, any_valid, spatial_shapes,
-                                         B, N, Q, C, S, P, query.dtype)
-            output = self.output_proj(output)
-            return self.drop(output) + query
+        weights = torch.where(valid_flat.any(dim=-2, keepdim=True), weights, 0.0)
         weights = weights.softmax(dim=-2).masked_fill(~valid_flat, 0.0)
         weights = weights.permute(0, 1, 3, 2)                # (B, Q, G, N*S*P)
 
@@ -318,45 +302,6 @@ class Detr3DCrossAttn(nn.Module):
 
         # Sum across cameras: (B*N, Q, C) → (B, N, Q, C) → (B, Q, C)
         return out.to(out_dtype).view(B, N, Q, C).sum(dim=1)
-
-    def _forward_flash(
-        self,
-        feats:          torch.Tensor,   # (B*N, sum_L, C)
-        u_n:            torch.Tensor,   # (B, N, Q, P)  in [0, 1] where valid
-        v_n:            torch.Tensor,   # (B, N, Q, P)
-        logits:         torch.Tensor,   # (B, Q, N*S*P, G) pre-softmax, -inf at invalid points
-        any_valid:      torch.Tensor,   # (B, Q, 1, 1) the query sees at least one valid point
-        spatial_shapes: list,
-        B: int, N: int, Q: int, C: int, S: int, P: int,
-        out_dtype: torch.dtype,
-    ) -> torch.Tensor:                  # (B, Q, C)
-        """DCNv4 FlashDeformAttn path: one kernel call per frame, cameras as extra levels.
-
-        Each camera's S pyramid levels become levels ``n * S + s`` of one (B, N*sum_L, G, C/G)
-        value, so the kernel's fused softmax over levels x points is exactly the global softmax
-        over N*S*P of the other paths, and the per-camera sum disappears.  Invalid points keep
-        their -inf logit (weight 0); a query with no valid point gets uniform logits and every
-        location moved off the image, so it samples zeros like the masked paths.  fp16 inside.
-        """
-        G = self.num_groups
-        value = feats.reshape(B, N * feats.shape[1], G, C // G).half()
-        key = (tuple(tuple(int(v) for v in hw) for hw in spatial_shapes), N, feats.device, "flash")
-        cached = _SHAPE_CACHE.get(key)
-        if cached is None:
-            shapes = torch.tensor([list(hw) for hw in key[0]] * N, dtype=torch.long, device=feats.device)
-            starts = torch.cat([shapes.new_zeros(1), (shapes[:, 0] * shapes[:, 1]).cumsum(0)[:-1]])
-            cached = _SHAPE_CACHE[key] = (shapes, starts)
-        shapes_t, level_start = cached
-        # Locations (B, Q, G, N, S, P, 2), the same per level and group; clamped so points behind a
-        # camera (huge u, v) stay finite in fp16 (they are out of range either way).
-        locs = torch.stack([u_n, v_n], dim=-1).clamp(-1.0, 2.0)          # (B, N, Q, P, 2)
-        locs = torch.where(any_valid.view(B, 1, Q, 1, 1), locs, -1.0)
-        locs = (locs.permute(0, 2, 1, 3, 4)[:, :, None, :, None]          # (B, Q, 1, N, 1, P, 2)
-                    .expand(B, Q, G, N, S, P, 2).reshape(B, Q, G, N * S * P * 2))
-        attn = logits.permute(0, 1, 3, 2)                                  # (B, Q, G, N*S*P)
-        sampling_loc_attn = torch.cat([locs.half(), attn.half()], dim=-1).contiguous()
-        out = FlashMSDAfn.apply(value, shapes_t, level_start, sampling_loc_attn, B, P)
-        return out.to(out_dtype).reshape(B, Q, C)
 
 class DecoderLayer(nn.Module):
     """Single Detr3D temporal decoder layer (post-norm, matching StreamPETR).

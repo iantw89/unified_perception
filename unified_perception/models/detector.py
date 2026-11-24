@@ -140,16 +140,6 @@ class UnifiedPerceptionModel(nn.Module):
             pixel_mean=cfg.data.pixel_mean,
             pixel_std=cfg.data.pixel_std,
         )
-        impl = getattr(m, "msda_impl", "mmcv")
-        if impl == "flash":
-            from .transformer import FLASH_MSDA_AVAILABLE, Detr3DCrossAttn
-            if not FLASH_MSDA_AVAILABLE:
-                raise ImportError("model.msda_impl=flash needs DCNv4 FlashDeformAttn (DCNv4_op) importable")
-            for module in self.modules():
-                if isinstance(module, Detr3DCrossAttn):
-                    module.flash_msda = True
-        elif impl != "mmcv":
-            raise ValueError(f"model.msda_impl must be 'mmcv' or 'flash', got {impl!r}")
 
     # ------------------------------------------------------------------ #
     def _run_backbone(self, flat_images: torch.Tensor, active: Optional[torch.Tensor],
