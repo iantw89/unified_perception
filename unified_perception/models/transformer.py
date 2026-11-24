@@ -290,10 +290,10 @@ class Detr3DCrossAttn(nn.Module):
             .float()
         )
 
-        # im2col_step must divide B*N; fall back to 1 if it does not
-        im2col_step = min(64, B * N)
-        if (B * N) % im2col_step != 0:
-            im2col_step = 1
+        # One chunk for the whole camera batch (im2col_step must divide B*N).  The former
+        # min(64, B*N)-or-1 rule fell back to one launch per camera image whenever B*N was not a
+        # multiple of 64 (batch 12 x 7 cameras = 84): 84 launches per call, 1.5x slower on a 4090.
+        im2col_step = B * N
 
         # Output: (B*N, Q, G*group_dims) = (B*N, Q, C)
         out = MMCVMSDAfn.apply(
