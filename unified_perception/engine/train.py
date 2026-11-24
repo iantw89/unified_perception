@@ -26,9 +26,16 @@ tqdm = get_tqdm()
 
 
 def _worker_init_fn(worker_id: int) -> None:
-    """Ensure FFmpeg shared DLLs are on the search path in each DataLoader worker (Windows)."""
+    """Ensure FFmpeg shared DLLs are on the search path in each DataLoader worker (Windows), and
+    keep each worker's OpenCV single-threaded: the workers are the parallelism, and on a cloud
+    container OpenCV sizes its pool to the host's cores (e.g. 224) rather than the CPU quota."""
     import sys as _sys
     import os as _os
+    try:
+        import cv2
+        cv2.setNumThreads(1)
+    except ImportError:
+        pass
     if _sys.platform == "win32" and hasattr(_os, "add_dll_directory"):
         ffmpeg_bin = _os.environ.get("FFMPEG_SHARED_BIN", "")
         if ffmpeg_bin and _os.path.isdir(ffmpeg_bin):
