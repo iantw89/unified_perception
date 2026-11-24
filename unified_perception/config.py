@@ -285,6 +285,9 @@ class ModelConfig:
     # Requires mmcv with CUDA extensions installed.  No-op (falls back to
     # PyTorch) when mmcv is not available or device is CPU.
     use_mmcv_msda: bool = True
+    # Deformable-attention kernel: "mmcv" (fp32, per camera) or "flash" (DCNv4 FlashDeformAttn:
+    # fp16, one call per frame with cameras as levels; needs DCNv4_op built and importable).
+    msda_impl: str = "mmcv"
 
     # --- Loss / matcher weights ---
     cost_class: float = 2.0
