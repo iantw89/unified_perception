@@ -122,11 +122,12 @@ def _prune_bwd(configs, named_args, **kwargs):
 
 # Tuned on a 4090 at the training shapes (84 images, 88 queries, 8 x 32, 3 x 13): BQ8/8 warps 4.1 ms,
 # BQ32/2 warps 5.2 ms, the untuned BQ32/4 warps ~7.5 ms.  The value gradient is reset between trials.
-# VEC_ONLY configs are the extra tiles the vector path can use (see _prune_bwd).
+# VEC_ONLY configs are the extra tiles the vector path can use (see _prune_bwd).  Few configs on
+# purpose: the fully unrolled backward takes minutes per config to compile.
 @triton.autotune(
     configs=[triton.Config({"BQ": bq, "VEC_ONLY": vo}, num_warps=nw)
-             for bq, nw, vo in ((8, 8, False), (32, 2, False), (8, 4, False), (16, 8, False), (16, 4, False),
-                                (8, 2, True), (16, 2, True), (32, 4, True), (32, 8, True), (64, 4, True))],
+             for bq, nw, vo in ((8, 8, False), (32, 2, False), (8, 4, False),
+                                (16, 4, True), (32, 4, True), (8, 2, True))],
     key=["Q", "G", "D", "L", "P", "VEC", "GFAST"], reset_to_zero=["gvalue_ptr"],
     prune_configs_by={"early_config_prune": _prune_bwd})
 @triton.jit

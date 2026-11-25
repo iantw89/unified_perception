@@ -2,7 +2,7 @@
 
     python -m unified_perception.tools.bench_msda_bwd [--images 84] [--queries 88] [--iters 50]
 
-Variants: scalar atomics (the default), vector atomics (sm_90+), heads-fastest grid, both.
+Variants: scalar atomics (the default), vector atomics (sm_90+), vector atomics + heads-fastest grid.
 Shapes default to the cloud run (84 images per decoder call, 88 queries, 8 heads x 32 channels,
 3 levels at 640 px, 13 points per level).
 """
@@ -10,7 +10,6 @@ Shapes default to the cloud run (84 images per decoder call, 88 queries, 8 heads
 from __future__ import annotations
 
 import argparse
-import itertools
 
 import torch
 
@@ -72,7 +71,7 @@ def main(argv=None):
     print(f"[msda] {torch.cuda.get_device_name()}  images={args.images} queries={args.queries}")
     t_mmcv = timed(lambda: run(value, shapes, starts, loc, attn, grad, "mmcv"), args.iters)
     print(f"[msda] mmcv                         fwd+bwd {t_mmcv:7.3f} ms")
-    for vec, gfast in itertools.product((False, True), (False, True)):
+    for vec, gfast in ((False, False), (True, False), (True, True)):
         msda_triton.BWD_VECTOR_ATOMICS, msda_triton.BWD_HEADS_FASTEST = vec, gfast
         got = run(value, shapes, starts, loc, attn, grad, "triton")
         errs = " ".join(f"{n} {((g - r).abs().max() / r.abs().max().clamp(min=1e-12)).item():.1e}"
