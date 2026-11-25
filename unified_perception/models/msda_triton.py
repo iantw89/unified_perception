@@ -75,8 +75,6 @@ def _msda_fwd(value_ptr, shapes_ptr, starts_ptr, loc_ptr, attn_ptr, out_ptr,
     tl.store(out, acc.to(out_ptr.dtype.element_ty), mask=qmask[:, None])
 
 
-# Tuned on a 4090 at the training shapes (84 images, 88 queries, 8 x 32, 3 x 13): BQ8/8 warps 4.1 ms,
-# BQ32/2 warps 5.2 ms, the untuned BQ32/4 warps ~7.5 ms.  The value gradient is reset between trials.
 @triton.jit
 def _red_add_v4(addr, v0, v1, v2, v3, mask):
     """One 16-byte vector reduction (``red.global.add.v4.f32``, sm_90+) per element of ``addr``:
@@ -111,14 +109,31 @@ def _scatter_corner(gvalue_ptr, r, ok, w, t0, t1, t2, t3, g, G: tl.constexpr, D:
                       mask=ok[:, None], sem="relaxed")
 
 
+def _prune_bwd(configs, named_args, **kwargs):
+    """The vector path issues its reductions from inline assembly, which Triton does not de-duplicate
+    across threads that hold replicated elements: keep only tiles with one (BQ, D / 4) element or
+    more per thread, so every reduction is issued exactly once."""
+    args = {**named_args, **kwargs}
+    if not args.get("VEC", False):
+        return [c for c in configs if not c.kwargs.get("VEC_ONLY", False)]
+    D = args["D"]
+    return [c for c in configs if c.kwargs["BQ"] * (D // 4) >= 32 * c.num_warps]
+
+
+# Tuned on a 4090 at the training shapes (84 images, 88 queries, 8 x 32, 3 x 13): BQ8/8 warps 4.1 ms,
+# BQ32/2 warps 5.2 ms, the untuned BQ32/4 warps ~7.5 ms.  The value gradient is reset between trials.
+# VEC_ONLY configs are the extra tiles the vector path can use (see _prune_bwd).
 @triton.autotune(
-    configs=[triton.Config({"BQ": bq}, num_warps=nw) for bq, nw in ((8, 8), (32, 2), (8, 4), (16, 8), (16, 4))],
-    key=["Q", "G", "D", "L", "P", "VEC", "GFAST"], reset_to_zero=["gvalue_ptr"])
+    configs=[triton.Config({"BQ": bq, "VEC_ONLY": vo}, num_warps=nw)
+             for bq, nw, vo in ((8, 8, False), (32, 2, False), (8, 4, False), (16, 8, False), (16, 4, False),
+                                (8, 2, True), (16, 2, True), (32, 4, True), (32, 8, True), (64, 4, True))],
+    key=["Q", "G", "D", "L", "P", "VEC", "GFAST"], reset_to_zero=["gvalue_ptr"],
+    prune_configs_by={"early_config_prune": _prune_bwd})
 @triton.jit
 def _msda_bwd(value_ptr, shapes_ptr, starts_ptr, loc_ptr, attn_ptr, gout_ptr,
               gvalue_ptr, gloc_ptr, gattn_ptr,
               S, Q, G: tl.constexpr, D: tl.constexpr, L: tl.constexpr, P: tl.constexpr, BQ: tl.constexpr,
-              VEC: tl.constexpr, GFAST: tl.constexpr):
+              VEC: tl.constexpr, GFAST: tl.constexpr, VEC_ONLY: tl.constexpr):
     if GFAST:       # heads on the fastest grid axis: the eight heads of a query tile run together
         g, pid_q, bv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     else:
