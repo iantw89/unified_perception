@@ -77,14 +77,52 @@ def _msda_fwd(value_ptr, shapes_ptr, starts_ptr, loc_ptr, attn_ptr, out_ptr,
 
 # Tuned on a 4090 at the training shapes (84 images, 88 queries, 8 x 32, 3 x 13): BQ8/8 warps 4.1 ms,
 # BQ32/2 warps 5.2 ms, the untuned BQ32/4 warps ~7.5 ms.  The value gradient is reset between trials.
+@triton.jit
+def _red_add_v4(addr, v0, v1, v2, v3, mask):
+    """One 16-byte vector reduction (``red.global.add.v4.f32``, sm_90+) per element of ``addr``:
+    four consecutive fp32 values at a 16-byte aligned address; no return value."""
+    return tl.inline_asm_elementwise(
+        asm="{ .reg .pred %p; setp.ne.b32 %p, $6, 0; @%p red.global.add.v4.f32 [$1], {$2, $3, $4, $5}; mov.u32 $0, 0; }",
+        constraints="=r,l,f,f,f,f,r",
+        args=[addr, v0, v1, v2, v3, mask.to(tl.int32)], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _quarters(x, BQ: tl.constexpr, D: tl.constexpr):
+    """(BQ, D) -> four (BQ, D // 4) tensors holding channels 4c, 4c + 1, 4c + 2, 4c + 3."""
+    x = tl.reshape(x, (BQ, D // 4, 2, 2))
+    j0, j1 = tl.split(x)              # last axis: channel 4c + 2i + j
+    c0, c2 = tl.split(j0)
+    c1, c3 = tl.split(j1)
+    return c0, c1, c2, c3
+
+
+@triton.jit
+def _scatter_corner(gvalue_ptr, r, ok, w, t0, t1, t2, t3, g, G: tl.constexpr, D: tl.constexpr,
+                    BQ: tl.constexpr, VEC: tl.constexpr, top):
+    if VEC:
+        c4 = tl.arange(0, D // 4) * 4
+        addr = (gvalue_ptr + (r[:, None] * G + g) * D + c4[None, :]).to(tl.int64, bitcast=True)
+        wq = w[:, None]
+        _red_add_v4(addr, wq * t0, wq * t1, wq * t2, wq * t3, ok[:, None] & (c4[None, :] >= 0))
+    else:
+        d = tl.arange(0, D)
+        tl.atomic_add(gvalue_ptr + (r[:, None] * G + g) * D + d[None, :], w[:, None] * top,
+                      mask=ok[:, None], sem="relaxed")
+
+
 @triton.autotune(
-    configs=[triton.Config({"BQ": bq}, num_warps=nw) for bq, nw in ((8, 8), (32, 2), (8, 4), (16, 8))],
-    key=["Q", "G", "D", "L", "P"], reset_to_zero=["gvalue_ptr"])
+    configs=[triton.Config({"BQ": bq}, num_warps=nw) for bq, nw in ((8, 8), (32, 2), (8, 4), (16, 8), (16, 4))],
+    key=["Q", "G", "D", "L", "P", "VEC", "GFAST"], reset_to_zero=["gvalue_ptr"])
 @triton.jit
 def _msda_bwd(value_ptr, shapes_ptr, starts_ptr, loc_ptr, attn_ptr, gout_ptr,
               gvalue_ptr, gloc_ptr, gattn_ptr,
-              S, Q, G: tl.constexpr, D: tl.constexpr, L: tl.constexpr, P: tl.constexpr, BQ: tl.constexpr):
-    pid_q, g, bv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+              S, Q, G: tl.constexpr, D: tl.constexpr, L: tl.constexpr, P: tl.constexpr, BQ: tl.constexpr,
+              VEC: tl.constexpr, GFAST: tl.constexpr):
+    if GFAST:       # heads on the fastest grid axis: the eight heads of a query tile run together
+        g, pid_q, bv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    else:
+        pid_q, g, bv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     q = pid_q * BQ + tl.arange(0, BQ)
     qmask = q < Q
     d = tl.arange(0, D)
@@ -128,14 +166,20 @@ def _msda_bwd(value_ptr, shapes_ptr, starts_ptr, loc_ptr, attn_ptr, gout_ptr,
             tl.store(gloc_ptr + (qg * (L * P) + lp) * 2, dw * W, mask=qmask)
             tl.store(gloc_ptr + (qg * (L * P) + lp) * 2 + 1, dh * H, mask=qmask)
             # value: scatter the bilinear share of top to the four corners
-            tl.atomic_add(gvalue_ptr + (r1[:, None] * G + g) * D + d[None, :], (hh * hw)[:, None] * top,
-                          mask=ok1[:, None], sem="relaxed")
-            tl.atomic_add(gvalue_ptr + (r2[:, None] * G + g) * D + d[None, :], (hh * lw)[:, None] * top,
-                          mask=ok2[:, None], sem="relaxed")
-            tl.atomic_add(gvalue_ptr + (r3[:, None] * G + g) * D + d[None, :], (lh * hw)[:, None] * top,
-                          mask=ok3[:, None], sem="relaxed")
-            tl.atomic_add(gvalue_ptr + (r4[:, None] * G + g) * D + d[None, :], (lh * lw)[:, None] * top,
-                          mask=ok4[:, None], sem="relaxed")
+            if VEC:
+                t0, t1, t2, t3 = _quarters(top, BQ, D)
+            else:
+                t0 = t1 = t2 = t3 = top
+            _scatter_corner(gvalue_ptr, r1, ok1, hh * hw, t0, t1, t2, t3, g, G, D, BQ, VEC, top)
+            _scatter_corner(gvalue_ptr, r2, ok2, hh * lw, t0, t1, t2, t3, g, G, D, BQ, VEC, top)
+            _scatter_corner(gvalue_ptr, r3, ok3, lh * hw, t0, t1, t2, t3, g, G, D, BQ, VEC, top)
+            _scatter_corner(gvalue_ptr, r4, ok4, lh * lw, t0, t1, t2, t3, g, G, D, BQ, VEC, top)
+
+#: Backward variants (module switches, set from model config): one 16-byte vector reduction per four
+#: channels instead of four scalar atomics (Hopper and newer only; ignored elsewhere), and the
+#: eight heads of a query tile scheduled next to each other.
+BWD_VECTOR_ATOMICS = False
+BWD_HEADS_FASTEST = False
 
 
 class MSDATritonFunction(torch.autograd.Function):
@@ -165,9 +209,13 @@ class MSDATritonFunction(torch.autograd.Function):
         gvalue = torch.zeros(value.shape, device=value.device, dtype=torch.float32)
         gloc = torch.empty_like(loc)
         gattn = torch.empty_like(attn)
-        grid = lambda meta: (triton.cdiv(Q, meta["BQ"]), G, Bv)
+        vec = (BWD_VECTOR_ATOMICS and value.device.type == "cuda"
+               and torch.cuda.get_device_capability(value.device)[0] >= 9 and D % 4 == 0)
+        gfast = BWD_HEADS_FASTEST
+        grid = ((lambda meta: (G, triton.cdiv(Q, meta["BQ"]), Bv)) if gfast else
+                (lambda meta: (triton.cdiv(Q, meta["BQ"]), G, Bv)))
         _msda_bwd[grid](value, shapes, starts, loc, attn, grad_out.contiguous(), gvalue, gloc, gattn,
-                        S, Q, G=G, D=D, L=L, P=P)
+                        S, Q, G=G, D=D, L=L, P=P, VEC=vec, GFAST=gfast)
         return (gvalue.to(value.dtype), None, None, gloc.to(ctx.loc_dtype), gattn.to(ctx.attn_dtype), None)
 
 

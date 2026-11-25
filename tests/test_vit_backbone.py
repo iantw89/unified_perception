@@ -148,3 +148,20 @@ def test_valid_region_groups_and_padding():
 def test_crop_alignment_follows_levels():
     assert DinoV3SimpleFPNBackbone(None, fpn_levels=3).crop_alignment == 32
     assert DinoV3SimpleFPNBackbone(None, fpn_levels=4).crop_alignment == 64
+
+
+def test_fp8_linear_matches_linear_cpu():
+    """The FP8 path (here its CPU reference) stays close to the bf16 linear it replaces."""
+    import torch.nn as nn
+    from unified_perception.models.vit_backbone import Fp8Linear, DinoV3ViT, to_fp8_blocks
+    torch.manual_seed(0)
+    lin = nn.Linear(64, 96)
+    x = torch.randn(3, 10, 64)
+    ref = lin(x)
+    out = Fp8Linear(lin)(x)
+    assert out.shape == ref.shape
+    cos = torch.nn.functional.cosine_similarity(out.flatten(), ref.flatten(), dim=0)
+    assert cos > 0.998
+    vit = DinoV3ViT("vits16")
+    assert to_fp8_blocks(vit, keep_bf16=1) == list(range(1, 11))
+    assert isinstance(vit.blocks[5].mlp.fc1, Fp8Linear) and isinstance(vit.blocks[0].attn.qkv, nn.Linear)

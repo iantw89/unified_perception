@@ -187,6 +187,10 @@ class ModelConfig:
     # torch.compile mode for the frozen trunk; "default" skips GEMM autotuning, whose per-shape
     # benchmarking recurs on streams with many image-size / image-count mixes.
     vit_compile_mode: str = "max-autotune-no-cudagraphs"
+    # Frozen trunk linears in FP8 (inference-only, models/vit_backbone.py: Fp8Linear; needs FP8
+    # tensor cores, i.e. Hopper / Ada).  The first and last ``vit_fp8_keep_bf16`` frozen blocks stay bf16.
+    vit_fp8: bool = False
+    vit_fp8_keep_bf16: int = 1
     # torch.compile each decoder layer's forward (and so its backward): fuses the many small per-frame
     # kernels of self-attention / cross-attention / FFN.  Compiles the bound method, so module and
     # checkpoint keys are unchanged.
@@ -194,6 +198,11 @@ class ModelConfig:
     # Deformable-attention kernel inside the mmcv path: "mmcv" (CUDA, fp32) or "triton"
     # (models/msda_triton.py: same layout and results, autotuned; forward 2-4x faster on a 4090).
     msda_impl: str = "mmcv"
+    # Triton backward variants: 16-byte vector reductions for the value gradient (one per four
+    # channels instead of four scalar atomics; Hopper and newer, ignored elsewhere), and the heads of
+    # a query tile scheduled together (better L2 locality for those reductions).
+    msda_vector_atomics: bool = False
+    msda_heads_fastest: bool = False
     # SimpleFPN levels: 3 = strides 8/16/32, 4 adds stride 64.  0 = by image size
     # (models/vit_backbone.py: fpn_levels_for): 3 at 640 px (a 10 x 10 stride-64 map is too coarse
     # to help), 4 from 1024 px (e.g. 1280 px: 20 x 20, needed for large people).

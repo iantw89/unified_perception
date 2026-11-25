@@ -74,6 +74,7 @@ class UnifiedPerceptionModel(nn.Module):
                 model_name, arch=BACKBONES[m.backbone].arch, out_channels=m.embed_dims,
                 trainable_blocks=m.vit_trainable_blocks, compile_trunk=m.vit_compile,
                 compile_mode=getattr(m, "vit_compile_mode", "max-autotune-no-cudagraphs"),
+                fp8=getattr(m, "vit_fp8", False), fp8_keep_bf16=getattr(m, "vit_fp8_keep_bf16", 1),
                 fpn_levels=m.vit_fpn_levels or fpn_levels_for(cfg.data.image_height, cfg.data.image_width))
         else:
             self.backbone = YOLOPoseBackbone(
@@ -144,7 +145,10 @@ class UnifiedPerceptionModel(nn.Module):
         if impl not in ("mmcv", "triton"):
             raise ValueError(f"model.msda_impl must be 'mmcv' or 'triton', got {impl!r}")
         if impl == "triton":
+            from . import msda_triton
             from .transformer import Detr3DCrossAttn
+            msda_triton.BWD_VECTOR_ATOMICS = bool(getattr(m, "msda_vector_atomics", False))
+            msda_triton.BWD_HEADS_FASTEST = bool(getattr(m, "msda_heads_fastest", False))
             for module in self.modules():
                 if isinstance(module, Detr3DCrossAttn):
                     module.triton_msda = True

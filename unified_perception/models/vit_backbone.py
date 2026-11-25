@@ -198,6 +198,60 @@ def fpn_levels_for(image_height: int, image_width: int) -> int:
     return 4 if max(image_height, image_width) >= 1024 else 3
 
 
+FP8_MAX = 448.0                 # float8_e4m3fn
+
+
+class Fp8Linear(nn.Module):
+    """Inference-only FP8 replacement for a frozen ``nn.Linear`` (Hopper / Ada FP8 tensor cores).
+
+    Weights are quantized once per output channel; activations per token at run time (dynamic
+    row-wise scaling, e4m3), and ``torch._scaled_mm`` accumulates in fp32 and writes the input
+    dtype.  Under ``torch.compile`` the activation quantization fuses into one kernel.  Without a
+    CUDA device (tests, CPU probes) it computes the same quantized product in plain matmuls.
+    """
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+        w = linear.weight.detach().float()
+        scale = (w.abs().amax(dim=1, keepdim=True) / FP8_MAX).clamp(min=1e-12)       # (out, 1)
+        self.register_buffer("weight_fp8", (w / scale).to(torch.float8_e4m3fn))
+        self.register_buffer("weight_scale", scale.t().contiguous())                 # (1, out)
+        bias = linear.bias
+        self.register_buffer("bias", None if bias is None else bias.detach().clone())
+        self.in_features, self.out_features = linear.in_features, linear.out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1])
+        x_scale = (x2.abs().amax(dim=1, keepdim=True).float() / FP8_MAX).clamp(min=1e-12)   # (M, 1)
+        xq = (x2.float() / x_scale).to(torch.float8_e4m3fn)
+        if x2.is_cuda:
+            out = torch._scaled_mm(xq, self.weight_fp8.t(), scale_a=x_scale, scale_b=self.weight_scale,
+                                   out_dtype=x.dtype)
+        else:
+            out = ((xq.float() @ self.weight_fp8.float().t()) * x_scale * self.weight_scale).to(x.dtype)
+        if self.bias is not None:
+            out = out + self.bias.to(out.dtype)
+        return out.reshape(*shape[:-1], self.out_features)
+
+
+def to_fp8_blocks(trunk: DinoV3ViT, keep_bf16: int) -> list[int]:
+    """Swap every Linear of the frozen blocks to :class:`Fp8Linear`, except the first and last
+    ``keep_bf16`` blocks (the patch-embedding input and the features the FPN reads are the most
+    sensitive).  Returns the converted block indices."""
+    depth = len(trunk.blocks)
+    converted = []
+    for i, block in enumerate(trunk.blocks):
+        if i < keep_bf16 or i >= depth - keep_bf16:
+            continue
+        for parent in (block.attn, block.mlp):
+            for name, child in list(parent.named_children()):
+                if isinstance(child, nn.Linear):
+                    setattr(parent, name, Fp8Linear(child))
+        converted.append(i)
+    return converted
+
+
 def _frozen_forward(trunk: DinoV3ViT, apply_norm: bool):
     """Embedding + frozen blocks (+ final norm and grid when the whole ViT is frozen)."""
     def run(x, cos, sin):
@@ -221,8 +275,10 @@ class DinoV3SimpleFPNBackbone(nn.Module):
     def __init__(self, weights: str | None, arch: str = "vitb16", out_channels: int = 256,
                  trainable_blocks: int = 0, frozen_dtype: torch.dtype = torch.bfloat16,
                  compile_trunk: bool = False, fpn_levels: int = 3,
-                 compile_mode: str = "max-autotune-no-cudagraphs"):
+                 compile_mode: str = "max-autotune-no-cudagraphs", fp8: bool = False,
+                 fp8_keep_bf16: int = 1):
         super().__init__()
+        self.fp8, self.fp8_keep_bf16 = fp8, fp8_keep_bf16
         self.vit = DinoV3ViT(arch)
         if weights:
             self.vit.load_official(weights)
@@ -255,7 +311,9 @@ class DinoV3SimpleFPNBackbone(nn.Module):
         if self.__dict__["_trunk"] is None:
             trunk = copy.deepcopy(self.vit).to(self.frozen_dtype).eval().requires_grad_(False)
             trunk.blocks = trunk.blocks[:self.num_frozen]
-            fn = _frozen_forward(trunk, apply_norm=self.trainable_blocks == 0)
+            if self.fp8:
+                to_fp8_blocks(trunk, self.fp8_keep_bf16)
+            fn =_frozen_forward(trunk, apply_norm=self.trainable_blocks == 0)
             compiled = None
             if self.compile_trunk:
                 # Compute-bound (large GEMMs): compile fuses norms/RoPE/residuals (~8% on a 4090);
