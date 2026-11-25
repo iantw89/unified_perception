@@ -169,7 +169,10 @@ def _msda_bwd(value_ptr, shapes_ptr, starts_ptr, loc_ptr, attn_ptr, gout_ptr,
             if VEC:
                 t0, t1, t2, t3 = _quarters(top, BQ, D)
             else:
-                t0 = t1 = t2 = t3 = top
+                t0 = top
+                t1 = top
+                t2 = top
+                t3 = top
             _scatter_corner(gvalue_ptr, r1, ok1, hh * hw, t0, t1, t2, t3, g, G, D, BQ, VEC, top)
             _scatter_corner(gvalue_ptr, r2, ok2, hh * lw, t0, t1, t2, t3, g, G, D, BQ, VEC, top)
             _scatter_corner(gvalue_ptr, r3, ok3, lh * hw, t0, t1, t2, t3, g, G, D, BQ, VEC, top)
