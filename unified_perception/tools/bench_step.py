@@ -56,6 +56,22 @@ def cached_batches(cfg, count: int, root: Path) -> list[dict]:
     return batches
 
 
+def _gpm_means(path: str) -> str:
+    """Means of the GPM columns of an nvidia-smi dmon log (the first sample is a warm-up)."""
+    names = ["engine", "sm_active", "sm_occupancy", "tensor", "hmma", "dram", "fp32", "fp16"]
+    rows = []
+    for line in Path(path).read_text().splitlines():
+        if line.startswith("#"):
+            continue
+        cols = line.split()
+        if len(cols) >= 8 and cols[-1] != "-":
+            rows.append([float(c) for c in cols[-8:]])
+    rows = rows[1:] or rows
+    if not rows:
+        return "no samples"
+    return ", ".join(f"{n} {sum(r[i] for r in rows) / len(rows):.1f}%" for i, n in enumerate(names)) +         f" ({len(rows)} samples)"
+
+
 def _site(stack) -> str:
     """Innermost frame inside the package (where the synchronizing call is made)."""
     for frame in reversed(stack):
@@ -80,6 +96,12 @@ def main(argv=None):
     ap.add_argument("--cudnn-benchmark", action="store_true")
     ap.add_argument("--compile-decoder", action="store_true", help="torch.compile the head's decoder")
     ap.add_argument("--live", action="store_true", help="real DataLoader + CUDAPrefetcher instead of cached batches")
+    ap.add_argument("--gpm", default=None, metavar="FILE",
+                    help="sample Hopper GPM counters (nvidia-smi dmon --gpm-metrics) during the timed steps "
+                         "into FILE and print their means")
+    ap.add_argument("--cpu-times", action="store_true",
+                    help="CPU seconds per step without the profiler: whole process (all threads, incl. the "
+                         "autograd backward thread) and the main thread alone")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config, args.overrides)
@@ -93,7 +115,8 @@ def main(argv=None):
     if args.live:
         # The trainer's real input path: streaming DataLoader workers + CUDAPrefetcher.
         from ..engine.step import CUDAPrefetcher
-        live = iter(CUDAPrefetcher(build_loaders(cfg)["train"], device))
+        live_prefetcher = CUDAPrefetcher(build_loaders(cfg)["train"], device)
+        live = iter(live_prefetcher)
         batches = []
     else:
         batches = cached_batches(cfg, args.batches, Path(args.cache))
@@ -101,6 +124,11 @@ def main(argv=None):
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location=device, weights_only=False)["model"]
         model.load_state_dict({k.removeprefix("_orig_mod."): v for k, v in state.items()})
+    trunk_ahead = None
+    if live is not None and getattr(cfg.train, "trunk_ahead", False):
+        from ..engine.step import TrunkAhead
+        trunk_ahead = TrunkAhead(model, device)
+        live_prefetcher._on_next = trunk_ahead.launch
     if args.compile_decoder:
         model.head.decoder = torch.compile(model.head.decoder, dynamic=None)
     criterion = SetCriterion(cfg.model, cfg.loss)
@@ -120,7 +148,11 @@ def main(argv=None):
         batch = next(live) if live is not None else _h2d_async(pinned[next(order) % len(pinned)], device)
         ts.h2d(batch)
         ts.normalize()
+        if trunk_ahead is not None:
+            trunk_ahead.take(batch)
         ts.forward()
+        if trunk_ahead is not None:
+            trunk_ahead.finish()
         if args.deferred:
             pending.append(ts.step_deferred(cfg.train.grad_clip))
             if len(pending) > 1:
@@ -134,13 +166,27 @@ def main(argv=None):
     for _ in range(args.warmup):
         step()
     torch.cuda.synchronize()
-    start = time.perf_counter()
+    sampler = None
+    if args.gpm:
+        import subprocess
+        sampler = subprocess.Popen(["nvidia-smi", "dmon", "--gpm-metrics", "1,2,3,5,7,10,12,13", "-d", "1",
+                                    "-f", args.gpm], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    start, cpu0, main0 = time.perf_counter(), time.process_time(), time.thread_time()
     for _ in range(args.steps):
         step()
     torch.cuda.synchronize()
+    if sampler is not None:
+        sampler.terminate()
+        sampler.wait()
+        print("[bench] GPM means over the timed steps: " + _gpm_means(args.gpm))
     per_step = (time.perf_counter() - start) / args.steps
+    cpu_step = (time.process_time() - cpu0) / args.steps
+    main_step = (time.thread_time() - main0) / args.steps
     print(f"[bench] {per_step:.3f} s/step over {args.steps} steps "
           f"(peak {torch.cuda.max_memory_allocated() / 1e9:.1f} GB)")
+    if args.cpu_times:
+        print(f"[bench] CPU per step: process {cpu_step:.3f} s, main thread {main_step:.3f} s, "
+              f"other threads {cpu_step - main_step:.3f} s (batch {cfg.data.batch_size})")
 
     if args.profile:
         from torch.profiler import ProfilerActivity, profile

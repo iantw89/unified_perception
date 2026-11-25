@@ -19,7 +19,7 @@ from ..data import MultiViewPoseDataset, ShuffleBufferDataset, collate_batch
 from ..data.registry import build_provider
 from ..models import SetCriterion, UnifiedPerceptionModel
 from .evaluate import run_eval
-from .step import CUDAPrefetcher, TrainStep
+from .step import CUDAPrefetcher, TrainStep, TrunkAhead
 from .train_viz import save_train_viz
 
 tqdm = get_tqdm()
@@ -284,6 +284,11 @@ def train(cfg: Config, config_path: str | None = None, argv: list[str] | None = 
     _norm_mean = torch.tensor(cfg.data.pixel_mean, dtype=torch.float32, device=device).view(1, 1, 1, 3, 1, 1)
     _norm_std  = torch.tensor(cfg.data.pixel_std,  dtype=torch.float32, device=device).view(1, 1, 1, 3, 1, 1)
     criterion = SetCriterion(cfg.model, cfg.loss)
+    trunk_ahead = None
+    if getattr(cfg.train, "trunk_ahead", False) and isinstance(train_loader, CUDAPrefetcher)             and hasattr(model.backbone, "trunk_ahead"):
+        trunk_ahead = TrunkAhead(model, device)
+        train_loader._on_next = trunk_ahead.launch
+        print("[train] trunk_ahead: next batch's frozen trunk overlapped on a side stream")
 
     if cfg.train.compile_model:
         if hasattr(torch, "compile"):
@@ -465,7 +470,11 @@ def train(cfg: Config, config_path: str | None = None, argv: list[str] | None = 
                 if warmup_step < cfg.train.warmup_iters:
                     for g in optimizer.param_groups:
                         g["lr"] = cfg.train.lr * (warmup_step + 1) / cfg.train.warmup_iters
+                if trunk_ahead is not None:
+                    trunk_ahead.take(batch)
                 ts.forward()
+                if trunk_ahead is not None:
+                    trunk_ahead.finish()
                 ctx = {"step": global_step, "it": it, "data_wait": data_wait,
                        "sequences": list(zip(batch.get("seq", []), batch.get("start", [])))}
                 current = (ts.step_deferred(cfg.train.grad_clip), ctx)
@@ -486,7 +495,11 @@ def train(cfg: Config, config_path: str | None = None, argv: list[str] | None = 
 
             ts.h2d(batch)
             ts.normalize()
+            if trunk_ahead is not None:
+                trunk_ahead.take(batch, use=not do_viz)
             ts.forward(return_2d=do_viz)
+            if trunk_ahead is not None:
+                trunk_ahead.finish()
             loss_val = ts.compute_loss()
 
             # ---- Loss divergence check (before backward to save compute) ----

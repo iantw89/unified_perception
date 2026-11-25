@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -342,7 +343,24 @@ class DinoV3SimpleFPNBackbone(nn.Module):
             images = F.interpolate(images, size=size, mode="bilinear", align_corners=False)
         return images.to(self.frozen_dtype)
 
-    def _vit_features(self, images: torch.Tensor, input_mean, input_std) -> torch.Tensor:
+    def _frozen_features(self, images: torch.Tensor, input_mean, input_std) -> torch.Tensor:
+        """Output of the frozen part (no autograd): the patch grid when the whole ViT is frozen,
+        else the tokens entering the first trainable block.  Uses features computed ahead of time
+        (:meth:`use_given_features`) when the training loop supplied them."""
+        given = self.__dict__.get("_given")
+        if given is not None:
+            feats = next(given, None)
+            if feats is None or feats.shape[0] != images.shape[0]:
+                raise RuntimeError("precomputed trunk features do not match this forward call")
+            if os.environ.get("UP_VERIFY_TRUNK_AHEAD"):      # debugging: recompute and compare
+                self.__dict__["_given"] = None
+                fresh = self._frozen_features(images, input_mean, input_std)
+                self.__dict__["_given"] = given
+                err = ((fresh.float() - feats.float()).abs().max() / fresh.float().abs().max()).item()
+                print(f"[trunk_ahead] verify: max relative difference {err:.2e}", flush=True)
+                if not err <= 1e-3:
+                    raise RuntimeError(f"precomputed trunk features differ from a fresh run ({err:.2e})")
+            return feats
         trunk, eager, compiled = self._frozen_trunk()
         fn = compiled if compiled is not None and images.is_cuda else eager
         outs, rope = [], None
@@ -353,11 +371,18 @@ class DinoV3SimpleFPNBackbone(nn.Module):
                 if rope is None:
                     rope = trunk.rope(h, w, x.device, x.dtype)
                 outs.append(fn(x, *rope))
+        return torch.cat(outs, 0)
+
+    def _vit_features(self, images: torch.Tensor, input_mean, input_std) -> torch.Tensor:
+        x = self._frozen_features(images, input_mean, input_std)
         if self.trainable_blocks == 0:
-            return torch.cat(outs, 0)
+            return x
+        p = self.vit.patch
+        h = round(images.shape[-2] / p) or 1
+        w = round(images.shape[-1] / p) or 1
         amp = torch.is_autocast_enabled(images.device.type)
         dtype = torch.get_autocast_dtype(images.device.type) if amp else torch.float32
-        x = torch.cat(outs, 0).to(dtype)
+        x = x.to(dtype)
         cos, sin = self.vit.rope(h, w, x.device, dtype)
         for block in self.vit.blocks[self.num_frozen:]:
             x = block(x, cos, sin)
@@ -383,20 +408,34 @@ class DinoV3SimpleFPNBackbone(nn.Module):
         rounded up to :attr:`crop_alignment`; each group runs the ViT and FPN on that region
         only, and its levels are zero-padded (bottom / right) back to the canvas grid."""
         H, W = x.shape[-2:]
+        strides = [8 * 2 ** i for i in range(self.fpn.num_levels)]
+        outputs = None
+        for index, part, gh, gw in self._groups(x, valid_hw):
+            levels = self._levels(part, input_mean, input_std)
+            if (gh, gw) != (H, W):
+                levels = [F.pad(level, (0, (W - gw) // s, 0, (H - gh) // s)) for level, s in zip(levels, strides)]
+            if index is None:
+                return levels, None
+            if outputs is None:
+                outputs = [level.new_zeros((x.shape[0], *level.shape[1:])) for level in levels]
+            outputs = [out.index_copy(0, index, level) for out, level in zip(outputs, levels)]
+        return outputs, None
+
+    def _groups(self, x: torch.Tensor, valid_hw: torch.Tensor | None):
+        """(index or None, images cropped to the group's region, h, w) per valid-size group, in
+        a fixed order (the same in :meth:`forward` and :meth:`trunk_ahead`)."""
+        H, W = x.shape[-2:]
         A = self.crop_alignment
         if H % A or W % A:
             raise ValueError(f"Canvas {H}x{W} must be a multiple of {A} (the coarsest FPN stride)")
         if valid_hw is None or x.shape[0] == 0:
-            return self._levels(x, input_mean, input_std), None
+            yield None, x, H, W
+            return
         hw = valid_hw.to(torch.long).cpu()
         h = ((hw[:, 0] + A - 1) // A * A).clamp(A, H)
         w = ((hw[:, 1] + A - 1) // A * A).clamp(A, W)
         keys = h * (W + 1) + w
         groups = keys.unique().tolist()
-        if groups == [H * (W + 1) + W]:
-            return self._levels(x, input_mean, input_std), None
-        strides = [8 * 2 ** i for i in range(self.fpn.num_levels)]
-        outputs = None
         for key in groups:
             gh, gw = divmod(int(key), W + 1)
             if len(groups) == 1:
@@ -405,11 +444,16 @@ class DinoV3SimpleFPNBackbone(nn.Module):
                 index = (keys == key).nonzero().squeeze(1)
                 index = index.pin_memory().to(x.device, non_blocking=True) if x.is_cuda else index.to(x.device)
                 part = x.index_select(0, index)
-            levels = self._levels(part[..., :gh, :gw], input_mean, input_std)
-            levels = [F.pad(level, (0, (W - gw) // s, 0, (H - gh) // s)) for level, s in zip(levels, strides)]
-            if index is None:
-                return levels, None
-            if outputs is None:
-                outputs = [level.new_zeros((x.shape[0], *level.shape[1:])) for level in levels]
-            outputs = [out.index_copy(0, index, level) for out, level in zip(outputs, levels)]
-        return outputs, None
+            yield index, part[..., :gh, :gw], gh, gw
+
+    def trunk_ahead(self, x: torch.Tensor, input_mean=None, input_std=None,
+                    valid_hw: torch.Tensor | None = None) -> list[torch.Tensor]:
+        """Frozen-trunk outputs for a later :meth:`forward` on the same inputs, one per size group
+        in forward's order (computed on whatever stream is current; see engine/step.py:
+        TrunkAhead)."""
+        return [self._frozen_features(part, input_mean, input_std) for _, part, _, _ in self._groups(x, valid_hw)]
+
+    def use_given_features(self, feats: list[torch.Tensor] | None) -> None:
+        """The next :meth:`forward` takes its frozen-trunk outputs from ``feats`` (in group order)
+        instead of computing them; ``None`` clears."""
+        self.__dict__["_given"] = None if feats is None else iter(feats)

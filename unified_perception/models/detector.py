@@ -157,6 +157,31 @@ class UnifiedPerceptionModel(nn.Module):
                 layer.forward = torch.compile(layer.forward, dynamic=True)
 
     # ------------------------------------------------------------------ #
+    def trunk_ahead(self, batch: dict) -> Optional[list]:
+        """Frozen-trunk outputs for this (device) batch, computed before its training forward
+        (engine/step.py: TrunkAhead).  Mirrors the view selection and crop grouping of
+        :meth:`forward`'s whole-window path; None for backbones without a frozen trunk."""
+        if not hasattr(self.backbone, "trunk_ahead"):
+            return None
+        imgs = batch["imgs"]
+        B, T, N, _, H, W = imgs.shape
+        mask_host = batch.get("camera_valid_host")
+        camera_valid = batch.get("camera_valid")
+        if mask_host is None and camera_valid is not None:
+            if camera_valid.is_cuda:
+                return None          # forward would select views on the device; not mirrored here
+            mask_host = camera_valid.bool()
+        image_hw_host = batch.get("image_hw_host")
+        image_hw = batch.get("image_hw")
+        if image_hw_host is None and isinstance(image_hw, torch.Tensor) and not image_hw.is_cuda:
+            image_hw_host = image_hw
+        index = _host_index(mask_host, imgs.device)
+        flat = imgs.reshape(B * T * N, 3, H, W)
+        images = flat if index is None else flat.index_select(0, index)
+        crop_rows = _active_rows(image_hw_host, mask_host, T) if self.crop_to_valid else None
+        mean, std = self.input_mean.view(1, 3, 1, 1), self.input_std.view(1, 3, 1, 1)
+        return self.backbone.trunk_ahead(images, mean, std, valid_hw=crop_rows)
+
     def _run_backbone(self, flat_images: torch.Tensor, active: Optional[torch.Tensor],
                       return_detections: bool = False, crop_rows: Optional[torch.Tensor] = None):
         """Backbone features of (M, 3, H, W) images, zero for inactive (padded) views."""

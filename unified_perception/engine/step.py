@@ -380,6 +380,57 @@ def _h2d_async(batch: dict, device: torch.device) -> dict:
     return out
 
 
+class TrunkAhead:
+    """Frozen-backbone work of the next batch on a side CUDA stream, overlapped with the current
+    step (``train.trunk_ahead``).
+
+    The frozen ViT trunk is large, regular GEMM work with no autograd; the decoder, loss and
+    backward of a step are many small latency-bound kernels that leave SMs idle (GPM on the H100:
+    engine active 86%, SM activity 76%, tensor pipe 13%).  ``launch`` (the CUDAPrefetcher hook)
+    queues the next batch's trunk on its own stream, gated only on that batch's H2D copy;
+    ``take`` hands the result to the backbone right before that batch's forward, which then skips
+    the trunk.  Results are identical (same frozen weights, same inputs).
+    """
+
+    def __init__(self, model, device: torch.device) -> None:
+        self.model = model
+        self.stream = torch.cuda.Stream(device=device)
+        self.pending: dict[int, tuple] = {}
+
+    def launch(self, batch: dict, h2d_event) -> None:
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_event(h2d_event)
+            with torch.no_grad():
+                feats = self.model.trunk_ahead(batch)
+        if feats is None:
+            return
+        done = torch.cuda.Event()
+        self.stream.record_event(done)
+        self.pending[id(batch)] = (batch, feats, done)
+
+    def take(self, batch: dict, use: bool = True) -> None:
+        """Before ``batch``'s forward: make the compute stream wait for its trunk outputs and hand
+        them to the backbone (``use=False`` discards them, e.g. for a visualisation forward that
+        encodes frame by frame).  A pending entry keeps its batch alive, so ids cannot collide."""
+        entry = self.pending.pop(id(batch), None)
+        while len(self.pending) > 1:              # batches that were never trained on (a break)
+            self.pending.pop(next(iter(self.pending)))
+        backbone = self.model.backbone
+        if entry is None:
+            backbone.use_given_features(None)
+            return
+        _, feats, done = entry
+        stream = torch.cuda.current_stream(self.stream.device)
+        stream.wait_event(done)
+        for f in feats:
+            f.record_stream(stream)
+        backbone.use_given_features(feats if use else None)
+
+    def finish(self) -> None:
+        """After the forward: the backbone must have consumed every handed-over output."""
+        self.model.backbone.use_given_features(None)
+
+
 class CUDAPrefetcher:
     """Wraps a DataLoader to overlap H2D transfers with GPU compute.
 
@@ -399,9 +450,12 @@ class CUDAPrefetcher:
             ...
     """
 
-    def __init__(self, loader, device: torch.device) -> None:
+    def __init__(self, loader, device: torch.device, on_next=None) -> None:
         self._loader = loader
         self._device = device
+        # Called with (next batch, its H2D event) as soon as that batch's copy is queued, before
+        # the current batch is yielded (TrunkAhead.launch).
+        self._on_next = on_next
 
     def _enqueue(self, raw, stream):
         with torch.cuda.stream(stream):
@@ -445,6 +499,8 @@ class CUDAPrefetcher:
             # Kick off H2D for the NEXT batch while the caller will
             # be processing the current one.
             nxt, nxt_evt = self._enqueue(raw, h2d_stream)
+            if self._on_next is not None:
+                self._on_next(nxt, nxt_evt)
 
             # Block the compute stream until the CURRENT batch's H2D is done.
             # (nxt's H2D may still be in flight — that's intentional.)

@@ -165,3 +165,28 @@ def test_fp8_linear_matches_linear_cpu():
     vit = DinoV3ViT("vits16")
     assert to_fp8_blocks(vit, keep_bf16=1) == list(range(1, 11))
     assert isinstance(vit.blocks[5].mlp.fc1, Fp8Linear) and isinstance(vit.blocks[0].attn.qkv, nn.Linear)
+
+
+def test_trunk_ahead_features_reproduce_forward_cpu():
+    """Frozen-trunk outputs computed ahead (engine/step.py: TrunkAhead) give the same levels as a
+    normal forward, across valid-size groups, and are consumed exactly once."""
+    torch.manual_seed(0)
+    bb = DinoV3SimpleFPNBackbone(None, arch="vits16", out_channels=32).eval()
+    imgs = torch.randint(0, 255, (4, 3, 256, 256), dtype=torch.uint8)
+    hw = torch.tensor([[192, 256], [256, 256], [180, 256], [256, 192]])
+    mean = torch.zeros(1, 3, 1, 1)
+    std = torch.full((1, 3, 1, 1), 255.0)
+    with torch.no_grad():
+        ref, _ = bb(imgs, input_mean=mean, input_std=std, valid_hw=hw)
+        feats = bb.trunk_ahead(imgs, mean, std, valid_hw=hw)
+        assert len(feats) == 3                         # 192x256, 256x256, 256x192 groups
+        bb.use_given_features(feats)
+        out, _ = bb(imgs, input_mean=mean, input_std=std, valid_hw=hw)
+        bb.use_given_features(None)
+    for a, b in zip(ref, out):
+        assert torch.equal(a, b)
+    bb.use_given_features(feats[:1])
+    with pytest.raises(RuntimeError):
+        with torch.no_grad():
+            bb(imgs, input_mean=mean, input_std=std, valid_hw=hw)
+    bb.use_given_features(None)

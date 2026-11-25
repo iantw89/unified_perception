@@ -362,6 +362,9 @@ class TrainConfig:
     # viz steps and other devices use the synchronous step.
     deferred_step: bool = True
     eval_interval: int = 1  # epochs
+    # Run the frozen ViT trunk of the next batch on a side CUDA stream, overlapped with the current
+    # step (engine/step.py: TrunkAhead).  Identical results; CUDA + ViT backbone only.
+    trunk_ahead: bool = False
     viz_batch_interval: int = 0  # save training viz every N global steps (0 = off)
     device: str = "auto"  # "auto" | "cuda" | "cpu" | "mps"
     seed: int = 0
