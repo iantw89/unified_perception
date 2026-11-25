@@ -189,7 +189,7 @@ train:
   ckpt_interval: 1
   ckpt_every_steps: 100
   cuda_memory_fraction: 0.95
-  eval_interval: 1
+  eval_interval: 5   # validation ~6 min of a ~43 min epoch; every 5th epoch (2026-11-25)
   viz_batch_interval: 5000
   device: cuda
   seed: 0
